@@ -47,6 +47,11 @@ REDIRECT_NEEDED_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+INSTAGRAM_SHORTCODE_PATTERN = re.compile(
+    r"(?:instagram\.com|instagr\.am)/(?:(?!share/)[^/?#]+/)?(?:p|tv|reels?)/([^/?#&]+)",
+    re.IGNORECASE,
+)
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -141,11 +146,43 @@ def extract_all_video_urls(
     return seen
 
 
+def _extract_clean_redirect_url(candidate: str | None) -> str | None:
+    if not candidate:
+        return None
+    if candidate.startswith("/"):
+        candidate = f"https://www.instagram.com{candidate}"
+    if not candidate.startswith("http"):
+        return None
+    if "/accounts/login" in candidate:
+        parsed = urllib.parse.urlparse(candidate)
+        qs = urllib.parse.parse_qs(parsed.query)
+        next_vals = qs.get("next")
+        if next_vals and next_vals[0]:
+            nxt = next_vals[0]
+            if nxt.startswith("/"):
+                nxt = f"https://www.instagram.com{nxt}"
+            if nxt.startswith("http") and "/accounts/login" not in nxt:
+                return nxt
+        return None
+    return candidate
+
+
 def _resolve_share_redirects(url: str) -> str:
     if not REDIRECT_NEEDED_PATTERN.search(url):
         return url
     try:
         from curl_cffi import requests as cffi_requests
+
+        # First try a single-hop check so Instagram /share/ links don't bounce twice to /accounts/login
+        resp_hop = cffi_requests.get(
+            url,
+            impersonate="chrome",
+            allow_redirects=False,
+            timeout=10,
+        )
+        loc_hop = _extract_clean_redirect_url(resp_hop.headers.get("location"))
+        if loc_hop and "/share/" not in loc_hop:
+            return loc_hop
 
         resp = cffi_requests.get(
             url,
@@ -154,18 +191,29 @@ def _resolve_share_redirects(url: str) -> str:
             timeout=10,
             stream=True,
         )
-        final_url = str(resp.url)
+        final_url = _extract_clean_redirect_url(str(resp.url))
         resp.close()
-        if final_url and final_url.startswith("http") and "/accounts/login" not in final_url:
+        if final_url and "/share/" not in final_url:
             return final_url
+
+        # Fallback with bot User-Agent which Instagram/TikTok often redirect cleanly for OG previews
+        resp_bot = cffi_requests.get(
+            url,
+            headers={"User-Agent": "TelegramBot (like TwitterBot)"},
+            allow_redirects=False,
+            timeout=10,
+        )
+        loc_bot = _extract_clean_redirect_url(resp_bot.headers.get("location"))
+        if loc_bot and "/share/" not in loc_bot:
+            return loc_bot
     except Exception:
         pass
 
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            final_url = resp.geturl()
-            if final_url and final_url.startswith("http") and "/accounts/login" not in final_url:
+            final_url = _extract_clean_redirect_url(resp.geturl())
+            if final_url:
                 return final_url
     except Exception:
         pass
@@ -392,6 +440,185 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
     return None
 
 
+def _download_cffi_or_urllib(url: str, dest: Path) -> None:
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        resp = cffi_requests.get(url, impersonate="chrome", timeout=35)
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            dest.write_bytes(resp.content)
+            return
+    except Exception:
+        pass
+    _download_file(url, dest)
+
+
+def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> VideoData | None:
+    match = INSTAGRAM_SHORTCODE_PATTERN.search(url)
+    if not match:
+        return None
+    shortcode = match.group(1)
+
+    title = "Video"
+    author = ""
+    width: int | None = None
+    height: int | None = None
+    duration: float | int | None = None
+    thumb_url: str | None = None
+    video_url: str | None = None
+    slide_image_urls: list[str] = []
+
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        # 1. Try Instagram Embed Captioned page (works without login even on datacenter IPs)
+        try:
+            emb_resp = cffi_requests.get(
+                f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
+                impersonate="chrome",
+                timeout=12,
+            )
+            if emb_resp.status_code == 200 and emb_resp.text:
+                html_text = emb_resp.text
+                ctx_match = re.search(r'"contextJSON"\s*:\s*"((?:[^"\\]|\\.)*)"', html_text)
+                if ctx_match:
+                    raw_ctx = json.loads(f'"{ctx_match.group(1)}"')
+                    ctx_data = json.loads(raw_ctx)
+                    gql = ctx_data.get("gql_data") or {}
+                    media = gql.get("shortcode_media") or gql.get("xdt_shortcode_media") or {}
+                    if media:
+                        owner = media.get("owner") or {}
+                        author = (owner.get("username") or owner.get("full_name") or "").strip()
+                        cap_edges = ((media.get("edge_media_to_caption") or {}).get("edges")) or []
+                        if cap_edges and isinstance(cap_edges[0], dict):
+                            node_txt = ((cap_edges[0].get("node") or {}).get("text") or "").strip()
+                            if node_txt:
+                                title = node_txt
+                        dims = media.get("dimensions") or {}
+                        if isinstance(dims.get("width"), (int, float)):
+                            width = int(dims["width"])
+                        if isinstance(dims.get("height"), (int, float)):
+                            height = int(dims["height"])
+                        if isinstance(media.get("video_duration"), (int, float)):
+                            duration = media["video_duration"]
+                        thumb_url = media.get("display_url") or media.get("thumbnail_src")
+                        video_url = media.get("video_url")
+
+                        if not video_url:
+                            sidecar = ((media.get("edge_sidecar_to_children") or {}).get("edges")) or []
+                            for edge in sidecar:
+                                node = (edge or {}).get("node") or {}
+                                if node.get("is_video") and node.get("video_url"):
+                                    video_url = node.get("video_url")
+                                    break
+                                img_candidate = node.get("display_url")
+                                if img_candidate:
+                                    slide_image_urls.append(img_candidate)
+
+                if not video_url:
+                    m_vid = re.search(r'\\"video_url\\"\s*:\s*\\"((?:[^"\\]|\\.)*)\\"', html_text)
+                    if m_vid:
+                        video_url = json.loads(f'"{m_vid.group(1)}"').replace(r"\/", "/")
+        except Exception:
+            pass
+
+        # 2. Try kkinstagram redirect to direct Instagram CDN MP4
+        if not video_url:
+            try:
+                kk_resp = cffi_requests.get(
+                    f"https://www.kkinstagram.com/reel/{shortcode}/",
+                    headers={"User-Agent": "TelegramBot (like TwitterBot)"},
+                    allow_redirects=False,
+                    timeout=10,
+                )
+                loc = kk_resp.headers.get("location")
+                if loc and loc.startswith("http") and (".mp4" in loc or "fbcdn.net" in loc or "cdninstagram.com" in loc):
+                    video_url = loc
+                elif kk_resp.status_code == 200 and kk_resp.text:
+                    og_m = re.search(
+                        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+                        kk_resp.text,
+                    )
+                    if og_m:
+                        video_url = html.unescape(og_m.group(1))
+            except Exception:
+                pass
+
+        # 3. Try vxinstagram offload MP4
+        if not video_url:
+            try:
+                vx_resp = cffi_requests.get(
+                    f"https://www.vxinstagram.com/reel/{shortcode}/",
+                    headers={"User-Agent": "TelegramBot (like TwitterBot)"},
+                    allow_redirects=True,
+                    timeout=10,
+                )
+                if vx_resp.status_code == 200 and vx_resp.text:
+                    og_m = re.search(
+                        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+                        vx_resp.text,
+                    )
+                    if og_m:
+                        video_url = html.unescape(og_m.group(1))
+                    if not thumb_url:
+                        img_m = re.search(
+                            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+                            vx_resp.text,
+                        )
+                        if img_m:
+                            thumb_url = html.unescape(img_m.group(1))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    caption = build_caption(url, title=title, author=author)
+    dur_int = int(round(duration)) if isinstance(duration, (int, float)) else None
+
+    if video_url and video_url.startswith("http"):
+        video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
+        try:
+            _download_cffi_or_urllib(video_url, video_dest)
+            if video_dest.exists() and video_dest.stat().st_size > 1000:
+                video_dest = _compress_video_if_needed(video_dest, dur_int, ffmpeg_path)
+                return VideoData(
+                    file_path=video_dest,
+                    title=title[:200],
+                    author=author[:100],
+                    caption=caption,
+                    width=width,
+                    height=height,
+                    duration=dur_int,
+                    direct_video_url=video_url,
+                    thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
+                )
+        except Exception:
+            video_dest.unlink(missing_ok=True)
+
+    if slide_image_urls:
+        image_paths: list[Path] = []
+        for idx, img_url in enumerate(slide_image_urls[:20]):
+            img_dest = DOWNLOAD_DIR / f"{unique_id}_igslide_{idx}.jpg"
+            try:
+                _download_cffi_or_urllib(img_url, img_dest)
+                if img_dest.exists() and img_dest.stat().st_size > 500:
+                    image_paths.append(img_dest)
+            except Exception:
+                img_dest.unlink(missing_ok=True)
+        if image_paths:
+            return VideoData(
+                file_path=None,
+                title=title[:200],
+                author=author[:100],
+                caption=caption,
+                is_slideshow=True,
+                image_paths=image_paths,
+                thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
+            )
+
+    return None
+
+
 def render_slideshow_to_video_sync(video_data: VideoData) -> Path | None:
     ffmpeg_path = _resolve_ffmpeg_path()
     if not ffmpeg_path or not video_data.image_paths:
@@ -456,6 +683,12 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
         tikwm_res = _try_tikwm_fallback(resolved_url, unique_id, ffmpeg_path)
         if tikwm_res:
             return tikwm_res
+
+    is_instagram = "instagram.com" in resolved_url.lower() or "instagr.am" in resolved_url.lower()
+    if is_instagram and not COOKIES_FILE.exists():
+        ig_res = _try_instagram_fallback(resolved_url, unique_id, ffmpeg_path)
+        if ig_res:
+            return ig_res
 
     output_template = str(DOWNLOAD_DIR / f"{unique_id}.%(ext)s")
     target_res = max_height or 1080
@@ -532,6 +765,11 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
         for leftover in DOWNLOAD_DIR.glob(f"{unique_id}.*"):
             leftover.unlink(missing_ok=True)
 
+        if is_instagram:
+            ig_res = _try_instagram_fallback(resolved_url, unique_id, ffmpeg_path)
+            if ig_res:
+                return ig_res
+
         if isinstance(exc, DownloadError):
             raise
         raise DownloadError(f"Download failed: {exc}") from exc
@@ -572,6 +810,30 @@ def _download_audio_sync(url: str) -> AudioData:
                 except Exception:
                     mp3_out.unlink(missing_ok=True)
             tikwm.cleanup()
+
+    if ("instagram.com" in resolved_url.lower() or "instagr.am" in resolved_url.lower()) and not COOKIES_FILE.exists():
+        ig_vid = _try_instagram_fallback(resolved_url, unique_id, ffmpeg_path)
+        if ig_vid:
+            if ig_vid.file_path and ig_vid.file_path.exists() and ffmpeg_path:
+                mp3_out = DOWNLOAD_DIR / f"{unique_id}_ig_extracted.mp3"
+                try:
+                    subprocess.run(
+                        [ffmpeg_path, "-y", "-i", str(ig_vid.file_path), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3_out)],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=60,
+                    )
+                    ig_vid.cleanup()
+                    return AudioData(
+                        file_path=mp3_out,
+                        title=ig_vid.title[:100],
+                        performer=ig_vid.author[:80],
+                        duration=ig_vid.duration,
+                    )
+                except Exception:
+                    mp3_out.unlink(missing_ok=True)
+            ig_vid.cleanup()
 
     output_template = str(DOWNLOAD_DIR / f"{unique_id}_audio.%(ext)s")
     ydl_opts: dict = {

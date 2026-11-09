@@ -263,6 +263,7 @@ async def _prepare_and_cache_video_for_inline(
     url: str,
     bot: Bot,
     user_id: int,
+    upload_timeout: float | None = None,
 ) -> tuple[CachedMedia | None, VideoData | None]:
     async with storage.get_lock(url):
         cached = storage.get_cached_media(url)
@@ -289,38 +290,62 @@ async def _prepare_and_cache_video_for_inline(
                 candidate_chats.append(saved_chat)
             if user_id and user_id not in candidate_chats:
                 candidate_chats.append(user_id)
-
-            for target_chat in candidate_chats:
+            for known_chat_str in list(storage.chat_settings.keys()):
                 try:
-                    temp_msg = await bot.send_video(
-                        chat_id=target_chat,
-                        video=FSInputFile(upload_path),
-                        width=video_data.width,
-                        height=video_data.height,
-                        duration=video_data.duration,
-                        supports_streaming=True,
-                        disable_notification=True,
-                    )
-                    if temp_msg.video:
-                        file_id = temp_msg.video.file_id
-                        caption = video_data.caption or build_caption(url, video_data.title, video_data.author)
-                        storage.save_media(
-                            url,
-                            file_id,
-                            caption=caption,
-                            title=video_data.title,
-                            author=video_data.author,
-                        )
-                        if not saved_chat:
-                            storage.set_fallback_storage_chat_id(target_chat)
-                        try:
-                            await temp_msg.delete()
-                        except Exception:
-                            pass
-                        return storage.get_cached_media(url), None
-                except Exception as exc:
-                    logger.warning("Could not upload temp inline video to chat %s: %s", target_chat, exc)
+                    known_chat_id = int(known_chat_str)
+                    if known_chat_id not in candidate_chats:
+                        candidate_chats.append(known_chat_id)
+                except ValueError:
                     continue
+
+            async def _try_upload_to_candidates() -> CachedMedia | None:
+                for target_chat in candidate_chats:
+                    try:
+                        # Fast 50ms check before uploading multi-MB video payload
+                        await bot.send_chat_action(chat_id=target_chat, action=ChatAction.UPLOAD_VIDEO)
+                        temp_msg = await bot.send_video(
+                            chat_id=target_chat,
+                            video=FSInputFile(upload_path),
+                            width=video_data.width,
+                            height=video_data.height,
+                            duration=video_data.duration,
+                            supports_streaming=True,
+                            disable_notification=True,
+                        )
+                        if temp_msg.video:
+                            file_id = temp_msg.video.file_id
+                            caption = video_data.caption or build_caption(url, video_data.title, video_data.author)
+                            storage.save_media(
+                                url,
+                                file_id,
+                                caption=caption,
+                                title=video_data.title,
+                                author=video_data.author,
+                            )
+                            if not saved_chat:
+                                storage.set_fallback_storage_chat_id(target_chat)
+                            try:
+                                await temp_msg.delete()
+                            except Exception:
+                                pass
+                            return storage.get_cached_media(url)
+                    except Exception as exc:
+                        logger.warning("Could not upload temp inline video to chat %s: %s", target_chat, exc)
+                        continue
+                return None
+
+            if upload_timeout and video_data.direct_video_url:
+                try:
+                    uploaded_media = await asyncio.wait_for(_try_upload_to_candidates(), timeout=upload_timeout)
+                    if uploaded_media:
+                        return uploaded_media, None
+                except asyncio.TimeoutError:
+                    logger.info("Inline upload exceeded %.1fs, returning direct_video_url for %s", upload_timeout, url)
+                    return None, video_data
+            else:
+                uploaded_media = await _try_upload_to_candidates()
+                if uploaded_media:
+                    return uploaded_media, None
 
             return None, video_data
         finally:
@@ -930,9 +955,17 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
 
     if not cached_media:
         try:
+            prep_task = asyncio.create_task(
+                _prepare_and_cache_video_for_inline(
+                    url,
+                    bot,
+                    inline_query.from_user.id,
+                    upload_timeout=4.5,
+                )
+            )
             cached_media, fallback_video_data = await asyncio.wait_for(
-                _prepare_and_cache_video_for_inline(url, bot, inline_query.from_user.id),
-                timeout=8.0,
+                asyncio.shield(prep_task),
+                timeout=9.0,
             )
             if not cached_media and fallback_video_data and fallback_video_data.direct_video_url:
                 caption = fallback_video_data.caption or build_caption(
@@ -953,12 +986,15 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
                     description=fallback_video_data.title or url,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
+                    video_width=fallback_video_data.width,
+                    video_height=fallback_video_data.height,
+                    video_duration=fallback_video_data.duration,
                     reply_markup=_video_keyboard(result_id, url),
                 )
                 await inline_query.answer([direct_result], cache_time=60, is_personal=False)
                 return
         except asyncio.TimeoutError:
-            logger.info("Inline download exceeded 8s timeout for %s, falling back to placeholder card", url)
+            logger.info("Inline download exceeded 9s timeout for %s, falling back to placeholder card", url)
         except Exception as exc:
             logger.warning("Inline direct download failed for %s: %s", url, exc)
 
