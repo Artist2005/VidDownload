@@ -473,7 +473,7 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
         "geo_bypass": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android_vr", "web"],
+                "player_client": ["android_sdkless", "mediaconnect", "web"],
             }
         },
     }
@@ -586,7 +586,7 @@ def _download_audio_sync(url: str) -> AudioData:
         "no_warnings": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android_vr", "web"],
+                "player_client": ["android_sdkless", "mediaconnect", "web"],
             }
         },
     }
