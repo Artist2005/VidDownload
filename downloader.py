@@ -52,6 +52,11 @@ INSTAGRAM_SHORTCODE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+TWITTER_STATUS_PATTERN = re.compile(
+    r"(?:twitter\.com|x\.com)/([\w.-]+)/status/(\d+)",
+    re.IGNORECASE,
+)
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -72,6 +77,7 @@ class VideoData:
     duration: int | None = None
     is_slideshow: bool = False
     image_paths: list[Path] = field(default_factory=list)
+    video_paths: list[Path] = field(default_factory=list)
     audio_path: Path | None = None
     direct_video_url: str | None = None
     thumbnail_url: str | None = None
@@ -79,6 +85,9 @@ class VideoData:
     def cleanup(self) -> None:
         if self.file_path and self.file_path.exists():
             self.file_path.unlink(missing_ok=True)
+        for vid in self.video_paths:
+            if vid.exists():
+                vid.unlink(missing_ok=True)
         for img in self.image_paths:
             if img.exists():
                 img.unlink(missing_ok=True)
@@ -356,7 +365,21 @@ def _compress_video_if_needed(
 def _download_file(url: str, dest: Path) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=30) as resp:
-        dest.write_bytes(resp.read())
+        cl = resp.headers.get("Content-Length")
+        if cl and cl.isdigit() and int(cl) > MAX_RAW_DOWNLOAD_BYTES:
+            raise DownloadError("Video exceeds maximum allowed download size.")
+        total = 0
+        with dest.open("wb") as fh:
+            while True:
+                chunk = resp.read(262144)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_RAW_DOWNLOAD_BYTES:
+                    fh.close()
+                    dest.unlink(missing_ok=True)
+                    raise DownloadError("Video exceeds maximum allowed download size.")
+                fh.write(chunk)
 
 
 def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> VideoData | None:
@@ -444,12 +467,32 @@ def _download_cffi_or_urllib(url: str, dest: Path) -> None:
     try:
         from curl_cffi import requests as cffi_requests
 
-        resp = cffi_requests.get(url, impersonate="chrome", timeout=35)
-        if resp.status_code == 200 and len(resp.content) > 1000:
-            dest.write_bytes(resp.content)
-            return
+        resp = cffi_requests.get(url, impersonate="chrome", timeout=35, stream=True)
+        try:
+            if resp.status_code == 200:
+                cl = resp.headers.get("content-length")
+                if cl and cl.isdigit() and int(cl) > MAX_RAW_DOWNLOAD_BYTES:
+                    raise DownloadError("Video exceeds maximum allowed download size.")
+                total = 0
+                with dest.open("wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=262144):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > MAX_RAW_DOWNLOAD_BYTES:
+                            fh.close()
+                            dest.unlink(missing_ok=True)
+                            raise DownloadError("Video exceeds maximum allowed download size.")
+                        fh.write(chunk)
+                if total > 1000:
+                    return
+                dest.unlink(missing_ok=True)
+        finally:
+            resp.close()
+    except DownloadError:
+        raise
     except Exception:
-        pass
+        dest.unlink(missing_ok=True)
     _download_file(url, dest)
 
 
@@ -466,6 +509,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
     duration: float | int | None = None
     thumb_url: str | None = None
     video_url: str | None = None
+    slide_video_urls: list[str] = []
     slide_image_urls: list[str] = []
 
     try:
@@ -504,15 +548,18 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                         thumb_url = media.get("display_url") or media.get("thumbnail_src")
                         video_url = media.get("video_url")
 
-                        if not video_url:
-                            sidecar = ((media.get("edge_sidecar_to_children") or {}).get("edges")) or []
-                            for edge in sidecar:
-                                node = (edge or {}).get("node") or {}
-                                if node.get("is_video") and node.get("video_url"):
-                                    video_url = node.get("video_url")
-                                    break
+                        sidecar = ((media.get("edge_sidecar_to_children") or {}).get("edges")) or []
+                        for edge in sidecar:
+                            node = (edge or {}).get("node") or {}
+                            if node.get("is_video") and node.get("video_url"):
+                                v_candidate = node.get("video_url")
+                                if v_candidate not in slide_video_urls:
+                                    slide_video_urls.append(v_candidate)
+                                if not video_url:
+                                    video_url = v_candidate
+                            else:
                                 img_candidate = node.get("display_url")
-                                if img_candidate:
+                                if img_candidate and img_candidate not in slide_image_urls:
                                     slide_image_urls.append(img_candidate)
 
                 if not video_url:
@@ -575,6 +622,42 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
     caption = build_caption(url, title=title, author=author)
     dur_int = int(round(duration)) if isinstance(duration, (int, float)) else None
 
+    # Multi-video or mixed carousel post
+    if len(slide_video_urls) > 1 or (slide_video_urls and slide_image_urls):
+        video_paths: list[Path] = []
+        image_paths: list[Path] = []
+        for idx, v_url in enumerate(slide_video_urls[:10]):
+            v_dest = DOWNLOAD_DIR / f"{unique_id}_igvid_{idx}.mp4"
+            try:
+                _download_cffi_or_urllib(v_url, v_dest)
+                if v_dest.exists() and v_dest.stat().st_size > 1000:
+                    v_dest = _compress_video_if_needed(v_dest, dur_int, ffmpeg_path)
+                    video_paths.append(v_dest)
+            except Exception:
+                v_dest.unlink(missing_ok=True)
+        for idx, img_url in enumerate(slide_image_urls[:10]):
+            img_dest = DOWNLOAD_DIR / f"{unique_id}_igslide_{idx}.jpg"
+            try:
+                _download_cffi_or_urllib(img_url, img_dest)
+                if img_dest.exists() and img_dest.stat().st_size > 500:
+                    image_paths.append(img_dest)
+            except Exception:
+                img_dest.unlink(missing_ok=True)
+        if video_paths:
+            return VideoData(
+                file_path=video_paths[0],
+                title=title[:200],
+                author=author[:100],
+                caption=caption,
+                width=width,
+                height=height,
+                duration=dur_int,
+                video_paths=video_paths,
+                image_paths=image_paths,
+                direct_video_url=slide_video_urls[0],
+                thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
+            )
+
     if video_url and video_url.startswith("http"):
         video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
         try:
@@ -596,7 +679,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
             video_dest.unlink(missing_ok=True)
 
     if slide_image_urls:
-        image_paths: list[Path] = []
+        image_paths = []
         for idx, img_url in enumerate(slide_image_urls[:20]):
             img_dest = DOWNLOAD_DIR / f"{unique_id}_igslide_{idx}.jpg"
             try:
@@ -616,6 +699,106 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                 thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
             )
 
+    return None
+
+
+def _try_twitter_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> VideoData | None:
+    match = TWITTER_STATUS_PATTERN.search(url)
+    if not match:
+        return None
+    username, status_id = match.group(1), match.group(2)
+    api_url = f"https://api.vxtwitter.com/{username}/status/{status_id}"
+
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        resp = cffi_requests.get(api_url, impersonate="chrome", timeout=12)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+
+    media_list = data.get("media_extended") or []
+    if not media_list:
+        return None
+
+    title = (data.get("text") or "Video").strip()
+    author = (data.get("user_name") or data.get("user_screen_name") or username).strip()
+    caption = build_caption(url, title=title, author=author)
+
+    for item in media_list:
+        if item.get("type") in ("video", "gif") and item.get("url"):
+            v_url = item["url"]
+            size_info = item.get("size") or {}
+            width = size_info.get("width") if isinstance(size_info.get("width"), int) else None
+            height = size_info.get("height") if isinstance(size_info.get("height"), int) else None
+            dur_ms = item.get("duration_millis")
+            dur_int = int(round(dur_ms / 1000)) if isinstance(dur_ms, (int, float)) else None
+            thumb = item.get("thumbnail_url")
+
+            video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
+            try:
+                _download_cffi_or_urllib(v_url, video_dest)
+                if video_dest.exists() and video_dest.stat().st_size > 1000:
+                    video_dest = _compress_video_if_needed(video_dest, dur_int, ffmpeg_path)
+                    return VideoData(
+                        file_path=video_dest,
+                        title=title[:200],
+                        author=author[:100],
+                        caption=caption,
+                        width=width,
+                        height=height,
+                        duration=dur_int,
+                        direct_video_url=v_url,
+                        thumbnail_url=thumb if isinstance(thumb, str) and thumb.startswith("http") else None,
+                    )
+            except Exception:
+                video_dest.unlink(missing_ok=True)
+    return None
+
+
+def _try_reddit_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> VideoData | None:
+    if "reddit.com" not in url.lower() and "redd.it" not in url.lower():
+        return None
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        rx_url = re.sub(r"https?://(?:[\w-]+\.)?reddit\.com", "https://rxddit.com", url, flags=re.IGNORECASE)
+        resp = cffi_requests.get(
+            rx_url,
+            headers={"User-Agent": "TelegramBot (like TwitterBot)"},
+            allow_redirects=True,
+            timeout=12,
+        )
+        if resp.status_code == 200 and resp.text:
+            og_v = re.search(
+                r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+                resp.text,
+            )
+            if og_v:
+                v_url = html.unescape(og_v.group(1))
+                t_m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', resp.text)
+                img_m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', resp.text)
+                title = html.unescape(t_m.group(1)).strip() if t_m else "Reddit Video"
+                thumb = html.unescape(img_m.group(1)).strip() if img_m else None
+                video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
+                try:
+                    _download_cffi_or_urllib(v_url, video_dest)
+                    if video_dest.exists() and video_dest.stat().st_size > 1000:
+                        video_dest = _compress_video_if_needed(video_dest, None, ffmpeg_path)
+                        return VideoData(
+                            file_path=video_dest,
+                            title=title[:200],
+                            author="Reddit",
+                            caption=build_caption(url, title=title, author="Reddit"),
+                            direct_video_url=v_url,
+                            thumbnail_url=thumb if isinstance(thumb, str) and thumb.startswith("http") else None,
+                        )
+                except Exception:
+                    video_dest.unlink(missing_ok=True)
+    except Exception:
+        pass
     return None
 
 
@@ -689,6 +872,12 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
         ig_res = _try_instagram_fallback(resolved_url, unique_id, ffmpeg_path)
         if ig_res:
             return ig_res
+
+    is_twitter = "twitter.com" in resolved_url.lower() or "x.com" in resolved_url.lower()
+    if is_twitter and not COOKIES_FILE.exists():
+        tw_res = _try_twitter_fallback(resolved_url, unique_id, ffmpeg_path)
+        if tw_res:
+            return tw_res
 
     output_template = str(DOWNLOAD_DIR / f"{unique_id}.%(ext)s")
     target_res = max_height or 1080
@@ -769,6 +958,14 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
             ig_res = _try_instagram_fallback(resolved_url, unique_id, ffmpeg_path)
             if ig_res:
                 return ig_res
+        if is_twitter:
+            tw_res = _try_twitter_fallback(resolved_url, unique_id, ffmpeg_path)
+            if tw_res:
+                return tw_res
+        if "reddit.com" in resolved_url.lower() or "redd.it" in resolved_url.lower():
+            rd_res = _try_reddit_fallback(resolved_url, unique_id, ffmpeg_path)
+            if rd_res:
+                return rd_res
 
         if isinstance(exc, DownloadError):
             raise

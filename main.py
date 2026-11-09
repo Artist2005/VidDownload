@@ -1137,6 +1137,7 @@ async def _process_single_url_in_chat(
                         parse_mode=ParseMode.HTML,
                         reply_markup=_video_keyboard(result_id, url, show_actions=cfg.show_mp3_button),
                         supports_streaming=True,
+                        message_thread_id=message.message_thread_id,
                     )
                     try:
                         await message.delete()
@@ -1200,6 +1201,49 @@ async def _process_single_url_in_chat(
                     )
                     if sent_audio.audio:
                         storage.save_audio_file_id(url, sent_audio.audio.file_id)
+            elif len(video_data.video_paths) > 1 or (video_data.video_paths and video_data.image_paths):
+                if status_msg:
+                    await status_msg.edit_text(
+                        f"{prefix}<b>Sending media album...</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VIDEO)
+                combined_items: list[tuple[str, Path]] = (
+                    [("video", p) for p in video_data.video_paths]
+                    + [("photo", p) for p in video_data.image_paths]
+                )
+                for chunk_start in range(0, len(combined_items), 10):
+                    chunk = combined_items[chunk_start : chunk_start + 10]
+                    media_group = []
+                    for idx, (kind, media_path) in enumerate(chunk):
+                        cap = display_caption if (chunk_start == 0 and idx == 0) else None
+                        pm = ParseMode.HTML if (chunk_start == 0 and idx == 0) else None
+                        if kind == "video":
+                            media_group.append(
+                                InputMediaVideo(
+                                    media=FSInputFile(media_path),
+                                    caption=cap,
+                                    parse_mode=pm,
+                                    supports_streaming=True,
+                                )
+                            )
+                        else:
+                            media_group.append(
+                                InputMediaPhoto(
+                                    media=FSInputFile(media_path),
+                                    caption=cap,
+                                    parse_mode=pm,
+                                )
+                            )
+                    sent_group = await message.reply_media_group(media=media_group)
+                    if chunk_start == 0 and sent_group and sent_group[0].video:
+                        storage.save_media(
+                            url,
+                            sent_group[0].video.file_id,
+                            caption=full_caption,
+                            title=video_data.title,
+                            author=video_data.author,
+                        )
             elif video_data.file_path and video_data.file_path.exists():
                 if status_msg:
                     await status_msg.edit_text(
@@ -1217,6 +1261,7 @@ async def _process_single_url_in_chat(
                         height=video_data.height,
                         duration=video_data.duration,
                         supports_streaming=True,
+                        message_thread_id=message.message_thread_id,
                     )
                     try:
                         await message.delete()

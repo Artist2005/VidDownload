@@ -1,9 +1,50 @@
 import asyncio
 import hashlib
 import json
+import os
+import urllib.parse
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from config import ADMIN_IDS, CACHE_FILE, MAX_CACHE_ENTRIES, STORAGE_CHAT_ID
+
+TRACKING_QUERY_PARAMS = {
+    "igsh",
+    "igshid",
+    "si",
+    "feature",
+    "is_from_webapp",
+    "sender_device",
+    "_r",
+    "_t",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "fbclid",
+    "s",
+    "t",
+}
+
+
+def normalize_url(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw.startswith("http"):
+        return raw
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        path = parsed.path.replace("/reels/", "/reel/")
+        if len(path) > 1 and path.endswith("/"):
+            path = path.rstrip("/")
+        if parsed.query:
+            pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=False)
+            filtered = [(k, v) for k, v in pairs if k.lower() not in TRACKING_QUERY_PARAMS]
+            clean_query = urllib.parse.urlencode(filtered)
+        else:
+            clean_query = ""
+        return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, clean_query, ""))
+    except Exception:
+        return raw
 
 
 @dataclass
@@ -112,14 +153,17 @@ class BotStorage:
             "fallback_storage_chat_id": self.fallback_storage_chat_id,
             "total_downloads": self.total_downloads,
         }
-        self.cache_path.write_text(
+        tmp_path = self.cache_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        os.replace(tmp_path, self.cache_path)
 
     @staticmethod
     def make_result_id(url: str) -> str:
-        return hashlib.md5(url.encode("utf-8")).hexdigest()[:20]
+        clean = normalize_url(url)
+        return hashlib.md5(clean.encode("utf-8")).hexdigest()[:20]
 
     def get_lock(self, key: str) -> asyncio.Lock:
         lock_id = self.make_result_id(key)
@@ -132,7 +176,11 @@ class BotStorage:
     def get_chat_settings(self, chat_id: int) -> ChatSettings:
         key = str(chat_id)
         if key not in self.chat_settings:
-            self.chat_settings[key] = ChatSettings()
+            self.chat_settings[key] = ChatSettings(
+                show_caption=True,
+                show_mp3_button=(chat_id > 0),
+                delete_source_msg=False,
+            )
         return self.chat_settings[key]
 
     def toggle_chat_setting(self, chat_id: int, field_name: str) -> ChatSettings:
@@ -144,9 +192,10 @@ class BotStorage:
         return cfg
 
     def register_url(self, url: str) -> str:
-        result_id = self.make_result_id(url)
-        if self.url_by_id.get(result_id) != url:
-            self.url_by_id[result_id] = url
+        clean = normalize_url(url)
+        result_id = self.make_result_id(clean)
+        if self.url_by_id.get(result_id) != clean:
+            self.url_by_id[result_id] = clean
             self._save()
         return result_id
 
@@ -154,7 +203,8 @@ class BotStorage:
         return self.url_by_id.get(result_id)
 
     def get_cached_media(self, url: str) -> CachedMedia | None:
-        return self.media_cache.get(url)
+        clean = normalize_url(url)
+        return self.media_cache.get(clean) or self.media_cache.get(url)
 
     def get_recent_media(
         self,
@@ -176,7 +226,7 @@ class BotStorage:
         return filtered[:limit]
 
     def get_file_id(self, url: str) -> str | None:
-        item = self.media_cache.get(url)
+        item = self.get_cached_media(url)
         return item.file_id if item else None
 
     def save_media(
@@ -187,14 +237,17 @@ class BotStorage:
         title: str = "",
         author: str = "",
     ) -> None:
-        existing = self.media_cache.get(url)
-        audio_id = existing.audio_file_id if existing else self.audio_only_cache.get(url)
-        vnote_id = existing.video_note_file_id if existing else self.video_note_cache.get(url)
-        if existing:
+        clean = normalize_url(url)
+        existing = self.media_cache.get(clean) or self.media_cache.get(url)
+        audio_id = existing.audio_file_id if existing else (self.audio_only_cache.get(clean) or self.audio_only_cache.get(url))
+        vnote_id = existing.video_note_file_id if existing else (self.video_note_cache.get(clean) or self.video_note_cache.get(url))
+        if clean in self.media_cache:
+            del self.media_cache[clean]
+        elif url in self.media_cache:
             del self.media_cache[url]
         else:
             self.total_downloads += 1
-        self.media_cache[url] = CachedMedia(
+        self.media_cache[clean] = CachedMedia(
             file_id=file_id,
             caption=caption,
             title=title,
@@ -202,39 +255,45 @@ class BotStorage:
             audio_file_id=audio_id,
             video_note_file_id=vnote_id,
         )
-        result_id = self.make_result_id(url)
-        self.url_by_id[result_id] = url
+        result_id = self.make_result_id(clean)
+        self.url_by_id[result_id] = clean
         self._save()
 
     def get_audio_file_id(self, url: str) -> str | None:
-        item = self.media_cache.get(url)
+        clean = normalize_url(url)
+        item = self.get_cached_media(clean)
         if item and item.audio_file_id:
             return item.audio_file_id
-        return self.audio_only_cache.get(url)
+        return self.audio_only_cache.get(clean) or self.audio_only_cache.get(url)
 
     def save_audio_file_id(self, url: str, audio_file_id: str) -> None:
-        self.audio_only_cache[url] = audio_file_id
-        if url in self.media_cache:
-            self.media_cache[url].audio_file_id = audio_file_id
+        clean = normalize_url(url)
+        self.audio_only_cache[clean] = audio_file_id
+        if clean in self.media_cache:
+            self.media_cache[clean].audio_file_id = audio_file_id
         self._save()
 
     def get_video_note_file_id(self, url: str) -> str | None:
-        item = self.media_cache.get(url)
+        clean = normalize_url(url)
+        item = self.get_cached_media(clean)
         if item and item.video_note_file_id:
             return item.video_note_file_id
-        return self.video_note_cache.get(url)
+        return self.video_note_cache.get(clean) or self.video_note_cache.get(url)
 
     def save_video_note_file_id(self, url: str, file_id: str) -> None:
-        self.video_note_cache[url] = file_id
-        if url in self.media_cache:
-            self.media_cache[url].video_note_file_id = file_id
+        clean = normalize_url(url)
+        self.video_note_cache[clean] = file_id
+        if clean in self.media_cache:
+            self.media_cache[clean].video_note_file_id = file_id
         self._save()
 
     def get_recognized_song(self, url: str) -> dict[str, str] | None:
-        return self.song_cache.get(url)
+        clean = normalize_url(url)
+        return self.song_cache.get(clean) or self.song_cache.get(url)
 
     def save_recognized_song(self, url: str, song_info: dict[str, str]) -> None:
-        self.song_cache[url] = song_info
+        clean = normalize_url(url)
+        self.song_cache[clean] = song_info
         self._save()
 
     def get_storage_chat_id(self) -> int | None:
