@@ -23,17 +23,17 @@ from config import (
 )
 
 SUPPORTED_DOMAIN_PATTERN = re.compile(
-    r"(https?://(?:[\w-]+\.)?(?:"
-    r"tiktok\.com"
-    r"|instagram\.com|instagr\.am"
-    r"|youtube\.com|youtu\.be"
-    r"|twitter\.com|x\.com|t\.co"
-    r"|reddit\.com|redd\.it"
-    r"|threads\.net|threads\.com"
-    r"|pinterest\.com|pin\.it"
-    r"|facebook\.com|fb\.watch|fb\.gg"
-    r"|twitch\.tv"
-    r")/[^\s<>\"']+)",
+    r"(https?://(?:"
+    r"(?:(?:vm|vt)\.tiktok\.com/[\w-]+|(?:[\w-]+\.)?tiktok\.com/(?:@[\w.-]+/(?:video|photo)/\d+|t/[\w-]+|v/\d+|video/\d+))"
+    r"|(?:[\w-]+\.)?(?:instagram\.com|instagr\.am)/(?:(?:(?!share/)[\w.-]+/)?(?:reels?|p|tv)/[\w-]+|share/(?:(?:reels?|p)/)?[\w-]+)"
+    r"|(?:(?:[\w-]+\.)?youtube\.com/(?:shorts/[\w-]+|watch\?[^\s<>\"']*v=[\w-]+|clip/[\w-]+)|youtu\.be/[\w-]+)"
+    r"|(?:(?:[\w-]+\.)?(?:twitter\.com|x\.com)/[\w.-]+/status/\d+|t\.co/[\w-]+)"
+    r"|(?:(?:[\w-]+\.)?reddit\.com/r/[\w.-]+/(?:comments|s)/[\w-]+|v\.redd\.it/[\w-]+|redd\.it/[\w-]+)"
+    r"|(?:[\w-]+\.)?threads\.(?:net|com)/(?:@[\w.-]+/post/|t/)[\w-]+"
+    r"|(?:(?:[\w-]+\.)?pinterest\.[\w.]+/pin/[\w-]+|pin\.it/[\w-]+)"
+    r"|(?:(?:[\w-]+\.)?facebook\.com/(?:reel/|watch/?\?v=|share/[rv]/|[\w.-]+/videos/)[\w-]+|fb\.watch/[\w-]+)"
+    r"|(?:(?:[\w-]+\.)?twitch\.tv/[\w.-]+/clip/[\w-]+|clips\.twitch\.tv/[\w-]+)"
+    r")[^\s<>\"']*)",
     re.IGNORECASE,
 )
 

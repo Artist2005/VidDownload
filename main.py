@@ -55,6 +55,7 @@ logger = logging.getLogger("video_bot")
 
 dp = Dispatcher()
 _BOT_USERNAME: str = "bot"
+_CAN_READ_ALL_GROUP_MESSAGES: bool = False
 
 
 def _main_menu_keyboard(bot_username: str) -> InlineKeyboardMarkup:
@@ -69,7 +70,7 @@ def _main_menu_keyboard(bot_username: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="Add Bot to a Group",
-                    url=f"https://t.me/{bot_username}?startgroup=true",
+                    url=f"https://t.me/{bot_username}?startgroup=true&admin=delete_messages",
                 )
             ],
             [
@@ -367,17 +368,21 @@ async def handle_bot_added_to_group(event: ChatMemberUpdated, bot: Bot) -> None:
     ):
         if not storage.get_storage_chat_id():
             storage.set_fallback_storage_chat_id(event.chat.id)
-        cfg = storage.get_chat_settings(event.chat.id)
+        privacy_hint = ""
+        if not _CAN_READ_ALL_GROUP_MESSAGES and new_status != ChatMemberStatus.ADMINISTRATOR:
+            privacy_hint = (
+                "\n\n<b>Important:</b> Give the bot <b>Admin rights</b> in this group (or disable "
+                "<i>Group Privacy</i> in @BotFather) so Telegram allows it to see links posted in the chat."
+            )
         await bot.send_message(
             chat_id=event.chat.id,
             text=(
-                f"<b>Thanks for adding @{_BOT_USERNAME}!</b>\n\n"
-                "I will automatically download videos from TikTok, Instagram, YouTube, Twitter (X), "
-                "Reddit, Threads, Facebook, Pinterest, and Twitch whenever someone posts a link.\n\n"
-                "Use /settings to customize captions or link cleanup for this group."
+                f"<b>@{_BOT_USERNAME} is active!</b>\n"
+                "Send any video or Reel link from TikTok, Instagram, YouTube, Twitter (X), "
+                "Reddit, Threads, Facebook, Pinterest, or Twitch, and I will automatically reply with the video."
+                f"{privacy_hint}"
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=_settings_keyboard(cfg, is_group=True),
         )
 
 
@@ -1110,14 +1115,6 @@ async def _process_single_url_in_chat(
     platform = detect_platform_name(url)
     result_id = storage.register_url(url)
 
-    if is_regular_youtube_url(url) and not storage.get_cached_media(url):
-        await message.reply(
-            f"{prefix}<b>Select YouTube download format and quality:</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_youtube_quality_keyboard(result_id),
-        )
-        return
-
     sender_note = ""
     if is_group and cfg.delete_source_msg and allow_delete_source and message.from_user:
         user_name = html.escape(message.from_user.full_name)
@@ -1157,15 +1154,18 @@ async def _process_single_url_in_chat(
             except TelegramBadRequest:
                 pass
 
-        status_msg = await message.reply(
-            f"{prefix}<b>Downloading from {platform}...</b>",
-            parse_mode=ParseMode.HTML,
-        )
+        status_msg: Message | None = None
+        if not is_group:
+            status_msg = await message.reply(
+                f"{prefix}<b>Downloading from {platform}...</b>",
+                parse_mode=ParseMode.HTML,
+            )
         video_data: VideoData | None = None
 
         try:
             await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VIDEO)
-            video_data = await download_video(url)
+            max_h = 720 if is_regular_youtube_url(url) else None
+            video_data = await download_video(url, max_height=max_h)
             full_caption = video_data.caption or build_caption(url, video_data.title, video_data.author)
             display_caption = (
                 full_caption
@@ -1174,10 +1174,11 @@ async def _process_single_url_in_chat(
             ) + sender_note
 
             if video_data.is_slideshow and video_data.image_paths:
-                await status_msg.edit_text(
-                    f"{prefix}<b>Sending photo slideshow ({len(video_data.image_paths)} photos)...</b>",
-                    parse_mode=ParseMode.HTML,
-                )
+                if status_msg:
+                    await status_msg.edit_text(
+                        f"{prefix}<b>Sending photo slideshow ({len(video_data.image_paths)} photos)...</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
                 await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_PHOTO)
                 for chunk_start in range(0, len(video_data.image_paths), 10):
                     chunk = video_data.image_paths[chunk_start : chunk_start + 10]
@@ -1200,10 +1201,11 @@ async def _process_single_url_in_chat(
                     if sent_audio.audio:
                         storage.save_audio_file_id(url, sent_audio.audio.file_id)
             elif video_data.file_path and video_data.file_path.exists():
-                await status_msg.edit_text(
-                    f"{prefix}<b>Sending video to chat...</b>",
-                    parse_mode=ParseMode.HTML,
-                )
+                if status_msg:
+                    await status_msg.edit_text(
+                        f"{prefix}<b>Sending video to chat...</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
                 await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VIDEO)
                 if is_group and cfg.delete_source_msg and allow_delete_source:
                     sent_msg = await message.answer_video(
@@ -1243,33 +1245,29 @@ async def _process_single_url_in_chat(
             else:
                 raise DownloadError("Media file was not found after download.")
 
-            try:
-                await status_msg.delete()
-            except TelegramBadRequest:
-                pass
-
-        except DownloadError as exc:
-            logger.warning("Download error in chat %s (%s): %s", message.chat.id, url, exc)
-            if message.chat.type == ChatType.PRIVATE:
-                await status_msg.edit_text(
-                    f"{prefix}<b>Failed to download video from {platform}.</b>\nReason: {html.escape(str(exc))}",
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                await status_msg.edit_text(
-                    f"{prefix}Failed to download video from {platform}. The link may be private.",
-                )
-                await asyncio.sleep(5)
+            if status_msg:
                 try:
                     await status_msg.delete()
                 except TelegramBadRequest:
                     pass
+
+        except DownloadError as exc:
+            logger.warning("Download error in chat %s (%s): %s", message.chat.id, url, exc)
+            if status_msg:
+                try:
+                    await status_msg.edit_text(
+                        f"{prefix}<b>Failed to download video from {platform}.</b>\nReason: {html.escape(str(exc))}",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramBadRequest:
+                    pass
         except Exception as exc:
             logger.exception("Error sending video in chat %s: %s", message.chat.id, exc)
-            try:
-                await status_msg.delete()
-            except TelegramBadRequest:
-                pass
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except TelegramBadRequest:
+                    pass
         finally:
             if video_data:
                 video_data.cleanup()
@@ -1285,7 +1283,16 @@ async def handle_message_with_link(message: Message, bot: Bot) -> None:
     elif message.chat.type == ChatType.PRIVATE:
         storage.set_fallback_storage_chat_id(message.chat.id)
 
-    text = message.text or message.caption or ""
+    text_parts: list[str] = []
+    if message.text:
+        text_parts.append(message.text)
+    if message.caption:
+        text_parts.append(message.caption)
+    for ent in (message.entities or []) + (message.caption_entities or []):
+        if getattr(ent, "url", None):
+            text_parts.append(ent.url)
+    text = "\n".join(text_parts)
+
     is_private_or_mentioned = (
         message.chat.type == ChatType.PRIVATE
         or f"@{_BOT_USERNAME.lower()}" in text.lower()
@@ -1341,7 +1348,7 @@ async def _maintenance_loop() -> None:
 
 
 async def main() -> None:
-    global _BOT_USERNAME
+    global _BOT_USERNAME, _CAN_READ_ALL_GROUP_MESSAGES
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN is missing! Create tg_bot/.env and set BOT_TOKEN=your_token")
         sys.exit(1)
@@ -1350,8 +1357,13 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     me = await bot.get_me()
     _BOT_USERNAME = me.username or "bot"
+    _CAN_READ_ALL_GROUP_MESSAGES = bool(me.can_read_all_group_messages)
     await _setup_bot_commands(bot)
-    logger.info("Bot @%s started successfully!", _BOT_USERNAME)
+    logger.info(
+        "Bot @%s started successfully! (can_read_all_group_messages=%s)",
+        _BOT_USERNAME,
+        _CAN_READ_ALL_GROUP_MESSAGES,
+    )
     asyncio.create_task(_maintenance_loop())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
