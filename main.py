@@ -261,11 +261,17 @@ def _build_stats_text(chat_id: int) -> str:
     )
 
 
+async def _delete_msg_quietly(msg: Message) -> None:
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
 async def _prepare_and_cache_video_for_inline(
     url: str,
     bot: Bot,
     user_id: int,
-    upload_timeout: float | None = None,
 ) -> tuple[CachedMedia | None, VideoData | None]:
     async with storage.get_lock(url):
         cached = storage.get_cached_media(url)
@@ -276,94 +282,68 @@ async def _prepare_and_cache_video_for_inline(
         video_data = await download_video(url, max_height=max_h)
         rendered_slideshow = None
 
-        upload_path = video_data.file_path
-        if video_data.is_slideshow and not upload_path:
-            try:
-                rendered_path = await render_slideshow_to_video(video_data)
-                upload_path = rendered_path
-                rendered_slideshow = rendered_path
-            except Exception as exc:
-                logger.warning("Slideshow render failed for %s: %s", url, exc)
+        try:
+            upload_path = video_data.file_path
+            if video_data.is_slideshow and not upload_path:
+                try:
+                    rendered_path = await render_slideshow_to_video(video_data)
+                    upload_path = rendered_path
+                    rendered_slideshow = rendered_path
+                except Exception as exc:
+                    logger.warning("Slideshow render failed for %s: %s", url, exc)
 
-        if not upload_path or not upload_path.exists():
+            if not upload_path or not upload_path.exists():
+                return None, video_data
+
+            candidate_chats: list[int] = []
+            saved_chat = storage.get_storage_chat_id()
+            if saved_chat:
+                candidate_chats.append(saved_chat)
+            if user_id and user_id not in candidate_chats:
+                candidate_chats.append(user_id)
+            for known_chat_str in list(storage.chat_settings.keys()):
+                try:
+                    known_chat_id = int(known_chat_str)
+                    if known_chat_id not in candidate_chats:
+                        candidate_chats.append(known_chat_id)
+                except ValueError:
+                    continue
+
+            for target_chat in candidate_chats:
+                try:
+                    if target_chat != saved_chat:
+                        await bot.send_chat_action(chat_id=target_chat, action=ChatAction.UPLOAD_VIDEO)
+                    temp_msg = await bot.send_video(
+                        chat_id=target_chat,
+                        video=FSInputFile(upload_path),
+                        width=video_data.width,
+                        height=video_data.height,
+                        duration=video_data.duration,
+                        supports_streaming=True,
+                        disable_notification=True,
+                    )
+                    if temp_msg.video:
+                        file_id = temp_msg.video.file_id
+                        caption = video_data.caption or build_caption(url, video_data.title, video_data.author)
+                        storage.save_media(
+                            url,
+                            file_id,
+                            caption=caption,
+                            title=video_data.title,
+                            author=video_data.author,
+                        )
+                        if not saved_chat:
+                            storage.set_fallback_storage_chat_id(target_chat)
+                        asyncio.create_task(_delete_msg_quietly(temp_msg))
+                        return storage.get_cached_media(url), video_data
+                except Exception as exc:
+                    logger.warning("Could not upload temp inline video to chat %s: %s", target_chat, exc)
+                    continue
+            return None, video_data
+        finally:
             video_data.cleanup()
             if rendered_slideshow and hasattr(rendered_slideshow, "unlink"):
                 rendered_slideshow.unlink(missing_ok=True)
-            return None, video_data
-
-        candidate_chats: list[int] = []
-        saved_chat = storage.get_storage_chat_id()
-        if saved_chat:
-            candidate_chats.append(saved_chat)
-        if user_id and user_id not in candidate_chats:
-            candidate_chats.append(user_id)
-        for known_chat_str in list(storage.chat_settings.keys()):
-            try:
-                known_chat_id = int(known_chat_str)
-                if known_chat_id not in candidate_chats:
-                    candidate_chats.append(known_chat_id)
-            except ValueError:
-                continue
-
-        async def _upload_and_cleanup() -> CachedMedia | None:
-            try:
-                for target_chat in candidate_chats:
-                    try:
-                        # Fast 50ms check before uploading multi-MB video payload
-                        await bot.send_chat_action(chat_id=target_chat, action=ChatAction.UPLOAD_VIDEO)
-                        temp_msg = await bot.send_video(
-                            chat_id=target_chat,
-                            video=FSInputFile(upload_path),
-                            width=video_data.width,
-                            height=video_data.height,
-                            duration=video_data.duration,
-                            supports_streaming=True,
-                            disable_notification=True,
-                        )
-                        if temp_msg.video:
-                            file_id = temp_msg.video.file_id
-                            caption = video_data.caption or build_caption(url, video_data.title, video_data.author)
-                            storage.save_media(
-                                url,
-                                file_id,
-                                caption=caption,
-                                title=video_data.title,
-                                author=video_data.author,
-                            )
-                            if not saved_chat:
-                                storage.set_fallback_storage_chat_id(target_chat)
-                            try:
-                                await temp_msg.delete()
-                            except Exception:
-                                pass
-                            return storage.get_cached_media(url)
-                    except Exception as exc:
-                        logger.warning("Could not upload temp inline video to chat %s: %s", target_chat, exc)
-                        continue
-                return None
-            finally:
-                video_data.cleanup()
-                if rendered_slideshow and hasattr(rendered_slideshow, "unlink"):
-                    rendered_slideshow.unlink(missing_ok=True)
-
-        if upload_timeout is not None:
-            upload_task = asyncio.create_task(_upload_and_cleanup())
-            try:
-                uploaded_media = await asyncio.wait_for(
-                    asyncio.shield(upload_task),
-                    timeout=upload_timeout,
-                )
-                return uploaded_media, video_data
-            except asyncio.TimeoutError:
-                logger.info(
-                    "Inline upload to Telegram exceeded %.1fs for %s; continuing upload in background",
-                    upload_timeout,
-                    url,
-                )
-                return None, video_data
-        else:
-            uploaded_media = await _upload_and_cleanup()
-            return uploaded_media, video_data
 
 
 @dp.my_chat_member()
@@ -977,16 +957,15 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
                     url,
                     bot,
                     inline_query.from_user.id,
-                    upload_timeout=2.5,
                 )
             )
             cached_media, fallback_video_data = await asyncio.wait_for(
                 asyncio.shield(prep_task),
-                timeout=4.2,
+                timeout=6.0,
             )
         except asyncio.TimeoutError:
             fallback_video_data = fallback_video_data or get_fast_meta(url)
-            logger.info("Inline download exceeded 4.2s timeout for %s, using fast meta or placeholder", url)
+            logger.info("Inline download exceeded 6.0s timeout for %s, using fast meta or placeholder", url)
         except Exception as exc:
             logger.warning("Inline direct download failed for %s: %s", url, exc)
 
@@ -1280,12 +1259,6 @@ async def _process_single_url_in_chat(
                             author=video_data.author,
                         )
             elif video_data.file_path and video_data.file_path.exists():
-                if status_msg:
-                    await status_msg.edit_text(
-                        f"{prefix}<b>Sending video to chat...</b>",
-                        parse_mode=ParseMode.HTML,
-                    )
-                await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VIDEO)
                 if is_group and cfg.delete_source_msg and allow_delete_source:
                     sent_msg = await message.answer_video(
                         video=FSInputFile(video_data.file_path),
@@ -1298,10 +1271,7 @@ async def _process_single_url_in_chat(
                         supports_streaming=True,
                         message_thread_id=message.message_thread_id,
                     )
-                    try:
-                        await message.delete()
-                    except TelegramBadRequest:
-                        pass
+                    asyncio.create_task(_delete_msg_quietly(message))
                 else:
                     sent_msg = await message.reply_video(
                         video=FSInputFile(video_data.file_path),
@@ -1326,10 +1296,7 @@ async def _process_single_url_in_chat(
                 raise DownloadError("Media file was not found after download.")
 
             if status_msg:
-                try:
-                    await status_msg.delete()
-                except TelegramBadRequest:
-                    pass
+                asyncio.create_task(_delete_msg_quietly(status_msg))
 
         except DownloadError as exc:
             logger.warning("Download error in chat %s (%s): %s", message.chat.id, url, exc)

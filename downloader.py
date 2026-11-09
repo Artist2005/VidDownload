@@ -582,33 +582,12 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
     try:
         from curl_cffi import requests as cffi_requests
 
-        # 1. Fast kkinstagram check (0.2s redirect to direct MP4)
-        try:
-            kk_resp = cffi_requests.get(
-                f"https://www.kkinstagram.com/reel/{shortcode}/",
-                headers={"User-Agent": "TelegramBot (like TwitterBot)"},
-                allow_redirects=False,
-                timeout=6,
-            )
-            loc = kk_resp.headers.get("location")
-            if loc and loc.startswith("http") and (".mp4" in loc or "fbcdn.net" in loc or "cdninstagram.com" in loc):
-                _add_candidate(loc)
-            elif kk_resp.status_code == 200 and kk_resp.text:
-                og_m = re.search(
-                    r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
-                    kk_resp.text,
-                )
-                if og_m:
-                    _add_candidate(html.unescape(og_m.group(1)))
-        except Exception:
-            pass
-
-        # 2. Instagram Embed Captioned page (metadata, thumbnails, and carousel slides)
+        # 1. Instagram Embed Captioned page (fast local CDN edge + metadata, thumbnails, and carousel slides)
         try:
             emb_resp = cffi_requests.get(
                 f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
                 impersonate="chrome",
-                timeout=7,
+                timeout=6,
             )
             if emb_resp.status_code == 200 and emb_resp.text:
                 html_text = emb_resp.text
@@ -649,11 +628,34 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                                 if img_candidate and img_candidate not in slide_image_urls:
                                     slide_image_urls.append(img_candidate)
 
-                m_vid = re.search(r'\\"video_url\\"\s*:\s*\\"((?:[^"\\]|\\.)*)\\"', html_text)
-                if m_vid:
-                    _add_candidate(json.loads(f'"{m_vid.group(1)}"').replace(r"\/", "/"))
+                if not candidate_video_urls:
+                    m_vid = re.search(r'\\"video_url\\"\s*:\s*\\"((?:[^"\\]|\\.)*)\\"', html_text)
+                    if m_vid:
+                        _add_candidate(json.loads(f'"{m_vid.group(1)}"').replace(r"\/", "/"))
         except Exception:
             pass
+
+        # 2. Only call kkinstagram if Embed page did not yield a direct video URL
+        if not candidate_video_urls and not slide_image_urls:
+            try:
+                kk_resp = cffi_requests.get(
+                    f"https://www.kkinstagram.com/reel/{shortcode}/",
+                    headers={"User-Agent": "TelegramBot (like TwitterBot)"},
+                    allow_redirects=False,
+                    timeout=5,
+                )
+                loc = kk_resp.headers.get("location")
+                if loc and loc.startswith("http") and (".mp4" in loc or "fbcdn.net" in loc or "cdninstagram.com" in loc):
+                    _add_candidate(loc)
+                elif kk_resp.status_code == 200 and kk_resp.text:
+                    og_m = re.search(
+                        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+                        kk_resp.text,
+                    )
+                    if og_m:
+                        _add_candidate(html.unescape(og_m.group(1)))
+            except Exception:
+                pass
 
         # 3. Try vxinstagram offload MP4 if no candidates found yet
         if not candidate_video_urls and not slide_image_urls:
