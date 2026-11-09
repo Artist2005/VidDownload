@@ -193,35 +193,30 @@ def _resolve_share_redirects(url: str) -> str:
     try:
         from curl_cffi import requests as cffi_requests
 
-        # First try a single-hop check so Instagram /share/ links don't bounce twice to /accounts/login
-        resp_hop = cffi_requests.get(
-            url,
-            impersonate="chrome",
-            allow_redirects=False,
-            timeout=10,
-        )
-        loc_hop = _extract_clean_redirect_url(resp_hop.headers.get("location"))
-        if loc_hop and "/share/" not in loc_hop:
-            return loc_hop
-
-        resp = cffi_requests.get(
-            url,
-            impersonate="chrome",
-            allow_redirects=True,
-            timeout=10,
-            stream=True,
-        )
-        final_url = _extract_clean_redirect_url(str(resp.url))
-        resp.close()
-        if final_url and "/share/" not in final_url:
-            return final_url
+        # Follow up to 4 redirect hops with allow_redirects=False so we never download full bodies or use stream=True
+        curr = url
+        for _ in range(4):
+            resp_hop = cffi_requests.get(
+                curr,
+                impersonate="chrome",
+                allow_redirects=False,
+                timeout=8,
+            )
+            loc_hop = _extract_clean_redirect_url(resp_hop.headers.get("location"))
+            if not loc_hop:
+                break
+            if "/share/" not in loc_hop and not REDIRECT_NEEDED_PATTERN.search(loc_hop):
+                return loc_hop
+            curr = loc_hop
+        if curr != url and "/share/" not in curr:
+            return curr
 
         # Fallback with bot User-Agent which Instagram/TikTok often redirect cleanly for OG previews
         resp_bot = cffi_requests.get(
             url,
             headers={"User-Agent": "TelegramBot (like TwitterBot)"},
             allow_redirects=False,
-            timeout=10,
+            timeout=8,
         )
         loc_bot = _extract_clean_redirect_url(resp_bot.headers.get("location"))
         if loc_bot and "/share/" not in loc_bot:
@@ -374,11 +369,13 @@ def _compress_video_if_needed(
 
     vcodec, pix_fmt, _, _, probed_dur = _probe_video_stream_info(file_path, ffmpeg_path)
     if not vcodec:
+        if size_bytes <= MAX_FILESIZE_BYTES:
+            return file_path
         file_path.unlink(missing_ok=True)
         raise DownloadError("Downloaded file does not contain a valid video stream.")
 
     needs_size_compression = size_bytes > MAX_FILESIZE_BYTES
-    needs_codec_transcode = vcodec != "h264" or pix_fmt != "yuv420p"
+    needs_codec_transcode = vcodec not in ("h264", "avc1") or pix_fmt != "yuv420p"
 
     # Fast lossless remux for H.264 videos <= 49 MB: fixes fragmented DASH containers, HE-AAC audio, and moov atom
     if not needs_size_compression and not needs_codec_transcode:
@@ -539,6 +536,12 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
             )
 
     play_url = data.get("play") or data.get("wmplay")
+    video_id = data.get("id")
+    clean_direct_url = (
+        f"https://www.tikwm.com/video/media/play/{video_id}.mp4"
+        if video_id
+        else (play_url if str(play_url).startswith("http") else None)
+    )
     if play_url:
         video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
         try:
@@ -554,7 +557,7 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
                 author=author,
                 caption=caption,
                 duration=int(duration) if isinstance(duration, (int, float)) else None,
-                direct_video_url=play_url if str(play_url).startswith("http") else None,
+                direct_video_url=clean_direct_url,
                 thumbnail_url=cover_url if str(cover_url).startswith("http") else None,
             )
         except Exception:
@@ -567,28 +570,12 @@ def _download_cffi_or_urllib(url: str, dest: Path) -> None:
     try:
         from curl_cffi import requests as cffi_requests
 
-        resp = cffi_requests.get(url, impersonate="chrome", timeout=35, stream=True)
-        try:
-            if resp.status_code == 200:
-                cl = resp.headers.get("content-length")
-                if cl and cl.isdigit() and int(cl) > MAX_RAW_DOWNLOAD_BYTES:
-                    raise DownloadError("Video exceeds maximum allowed download size.")
-                total = 0
-                with dest.open("wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=262144):
-                        if not chunk:
-                            continue
-                        total += len(chunk)
-                        if total > MAX_RAW_DOWNLOAD_BYTES:
-                            fh.close()
-                            dest.unlink(missing_ok=True)
-                            raise DownloadError("Video exceeds maximum allowed download size.")
-                        fh.write(chunk)
-                if total > 1000:
-                    return
-                dest.unlink(missing_ok=True)
-        finally:
-            resp.close()
+        resp = cffi_requests.get(url, impersonate="chrome", timeout=35)
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            if len(resp.content) > MAX_RAW_DOWNLOAD_BYTES:
+                raise DownloadError("Video exceeds maximum allowed download size.")
+            dest.write_bytes(resp.content)
+            return
     except DownloadError:
         raise
     except Exception:
@@ -1036,6 +1023,8 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
                     if fmt.get("ext") == "mp4" and fmt.get("vcodec") != "none" and fmt.get("acodec") != "none":
                         direct_url = fmt.get("url")
                         break
+            if direct_url and ("googlevideo.com" in direct_url or ".m3u8" in direct_url):
+                direct_url = None
 
             downloaded_path = _compress_video_if_needed(downloaded_path, dur_int, ffmpeg_path)
 

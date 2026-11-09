@@ -200,7 +200,12 @@ class BotStorage:
         return result_id
 
     def get_url(self, result_id: str) -> str | None:
-        return self.url_by_id.get(result_id)
+        clean_id = (result_id or "").strip()
+        for prefix in ("cached_", "direct_", "load_", "hist_"):
+            if clean_id.startswith(prefix):
+                clean_id = clean_id[len(prefix):]
+                break
+        return self.url_by_id.get(clean_id) or self.url_by_id.get(result_id)
 
     def get_cached_media(self, url: str) -> CachedMedia | None:
         clean = normalize_url(url)

@@ -264,6 +264,7 @@ async def _prepare_and_cache_video_for_inline(
     url: str,
     bot: Bot,
     user_id: int,
+    upload_timeout: float | None = None,
 ) -> tuple[CachedMedia | None, VideoData | None]:
     async with storage.get_lock(url):
         cached = storage.get_cached_media(url)
@@ -274,31 +275,37 @@ async def _prepare_and_cache_video_for_inline(
         video_data = await download_video(url, max_height=max_h)
         rendered_slideshow = None
 
-        try:
-            upload_path = video_data.file_path
-            if video_data.is_slideshow and not upload_path:
+        upload_path = video_data.file_path
+        if video_data.is_slideshow and not upload_path:
+            try:
                 rendered_path = await render_slideshow_to_video(video_data)
                 upload_path = rendered_path
                 rendered_slideshow = rendered_path
+            except Exception as exc:
+                logger.warning("Slideshow render failed for %s: %s", url, exc)
 
-            if not upload_path or not upload_path.exists():
-                return None, video_data
+        if not upload_path or not upload_path.exists():
+            video_data.cleanup()
+            if rendered_slideshow and hasattr(rendered_slideshow, "unlink"):
+                rendered_slideshow.unlink(missing_ok=True)
+            return None, video_data
 
-            candidate_chats: list[int] = []
-            saved_chat = storage.get_storage_chat_id()
-            if saved_chat:
-                candidate_chats.append(saved_chat)
-            if user_id and user_id not in candidate_chats:
-                candidate_chats.append(user_id)
-            for known_chat_str in list(storage.chat_settings.keys()):
-                try:
-                    known_chat_id = int(known_chat_str)
-                    if known_chat_id not in candidate_chats:
-                        candidate_chats.append(known_chat_id)
-                except ValueError:
-                    continue
+        candidate_chats: list[int] = []
+        saved_chat = storage.get_storage_chat_id()
+        if saved_chat:
+            candidate_chats.append(saved_chat)
+        if user_id and user_id not in candidate_chats:
+            candidate_chats.append(user_id)
+        for known_chat_str in list(storage.chat_settings.keys()):
+            try:
+                known_chat_id = int(known_chat_str)
+                if known_chat_id not in candidate_chats:
+                    candidate_chats.append(known_chat_id)
+            except ValueError:
+                continue
 
-            async def _try_upload_to_candidates() -> CachedMedia | None:
+        async def _upload_and_cleanup() -> CachedMedia | None:
+            try:
                 for target_chat in candidate_chats:
                     try:
                         # Fast 50ms check before uploading multi-MB video payload
@@ -333,16 +340,29 @@ async def _prepare_and_cache_video_for_inline(
                         logger.warning("Could not upload temp inline video to chat %s: %s", target_chat, exc)
                         continue
                 return None
+            finally:
+                video_data.cleanup()
+                if rendered_slideshow and hasattr(rendered_slideshow, "unlink"):
+                    rendered_slideshow.unlink(missing_ok=True)
 
-            uploaded_media = await _try_upload_to_candidates()
-            if uploaded_media:
-                return uploaded_media, None
-
-            return None, video_data
-        finally:
-            video_data.cleanup()
-            if rendered_slideshow and hasattr(rendered_slideshow, "unlink"):
-                rendered_slideshow.unlink(missing_ok=True)
+        if upload_timeout is not None:
+            upload_task = asyncio.create_task(_upload_and_cleanup())
+            try:
+                uploaded_media = await asyncio.wait_for(
+                    asyncio.shield(upload_task),
+                    timeout=upload_timeout,
+                )
+                return uploaded_media, video_data
+            except asyncio.TimeoutError:
+                logger.info(
+                    "Inline upload to Telegram exceeded %.1fs for %s; continuing upload in background",
+                    upload_timeout,
+                    url,
+                )
+                return None, video_data
+        else:
+            uploaded_media = await _upload_and_cleanup()
+            return uploaded_media, video_data
 
 
 @dp.my_chat_member()
@@ -947,6 +967,7 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
     platform = detect_platform_name(url)
     result_id = storage.register_url(url)
     cached_media = storage.get_cached_media(url)
+    fallback_video_data: VideoData | None = None
 
     if not cached_media:
         try:
@@ -955,21 +976,22 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
                     url,
                     bot,
                     inline_query.from_user.id,
+                    upload_timeout=4.0,
                 )
             )
-            cached_media, _ = await asyncio.wait_for(
+            cached_media, fallback_video_data = await asyncio.wait_for(
                 asyncio.shield(prep_task),
-                timeout=9.2,
+                timeout=7.5,
             )
         except asyncio.TimeoutError:
-            logger.info("Inline download exceeded 9.2s timeout for %s, falling back to placeholder card", url)
+            logger.info("Inline download exceeded 7.5s timeout for %s, falling back to placeholder card", url)
         except Exception as exc:
             logger.warning("Inline direct download failed for %s: %s", url, exc)
 
     if cached_media:
         caption = cached_media.caption or build_caption(url, cached_media.title, cached_media.author)
         cached_video = InlineQueryResultCachedVideo(
-            id=result_id,
+            id=f"cached_{result_id}",
             video_file_id=cached_media.file_id,
             title=f"Send Video from {platform}",
             description=cached_media.title or url,
@@ -977,11 +999,40 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
             parse_mode=ParseMode.HTML,
             reply_markup=_video_keyboard(result_id, url),
         )
-        await inline_query.answer([cached_video], cache_time=300, is_personal=False)
-        return
+        try:
+            await inline_query.answer([cached_video], cache_time=300, is_personal=False)
+            return
+        except TelegramBadRequest as exc:
+            logger.warning("Inline answer with cached_video failed for %s: %s", url, exc)
+
+    if fallback_video_data and fallback_video_data.direct_video_url:
+        caption = fallback_video_data.caption or build_caption(
+            url,
+            fallback_video_data.title,
+            fallback_video_data.author,
+        )
+        direct_video = InlineQueryResultVideo(
+            id=f"direct_{result_id}",
+            video_url=fallback_video_data.direct_video_url,
+            mime_type="video/mp4",
+            thumbnail_url=fallback_video_data.thumbnail_url or fallback_video_data.direct_video_url,
+            title=f"Send Video from {platform}",
+            description=fallback_video_data.title or url,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            video_width=fallback_video_data.width,
+            video_height=fallback_video_data.height,
+            video_duration=fallback_video_data.duration,
+            reply_markup=_video_keyboard(result_id, url),
+        )
+        try:
+            await inline_query.answer([direct_video], cache_time=60, is_personal=False)
+            return
+        except TelegramBadRequest as exc:
+            logger.warning("Inline answer with direct_video failed for %s: %s", url, exc)
 
     download_article = InlineQueryResultArticle(
-        id=result_id,
+        id=f"load_{result_id}",
         title=f"Send Video from {platform}",
         description=f"Tap here to send the video to chat ({url[:60]})",
         input_message_content=InputTextMessageContent(
@@ -991,7 +1042,10 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
         ),
         reply_markup=_loading_keyboard(result_id, platform),
     )
-    await inline_query.answer([download_article], cache_time=1, is_personal=False)
+    try:
+        await inline_query.answer([download_article], cache_time=1, is_personal=False)
+    except TelegramBadRequest as exc:
+        logger.warning("Inline answer with download_article failed for %s: %s", url, exc)
 
 
 async def _replace_inline_message_with_video(
@@ -1023,6 +1077,7 @@ async def _replace_inline_message_with_video(
                 media=cached_media.file_id,
                 caption=caption,
                 parse_mode=ParseMode.HTML,
+                supports_streaming=True,
             ),
             reply_markup=_video_keyboard(result_id, url),
         )
@@ -1052,6 +1107,11 @@ async def _replace_inline_message_with_video(
 async def handle_chosen_inline_result(chosen: ChosenInlineResult, bot: Bot) -> None:
     inline_message_id = chosen.inline_message_id
     if not inline_message_id:
+        return
+
+    # Only replace the message if the user picked the "Loading video..." placeholder article.
+    # If the user already sent a cached_ or direct_ video, do NOT overwrite the video message.
+    if not (chosen.result_id or "").startswith("load_"):
         return
 
     url = extract_video_url(chosen.query, allow_any_http=True) or storage.get_url(chosen.result_id)
