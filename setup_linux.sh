@@ -3,10 +3,10 @@ set -e
 
 cd "$(dirname "$0")"
 
-echo "[1/4] Checking system packages (python3-venv, ffmpeg)..."
+echo "[1/4] Checking system packages (python3-venv, ffmpeg, nodejs)..."
 if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update -y
-    sudo apt-get install -y python3 python3-venv python3-pip ffmpeg
+    sudo apt-get install -y python3 python3-venv python3-pip ffmpeg nodejs
 fi
 
 echo "[2/4] Creating Python virtual environment (.venv)..."

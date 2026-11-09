@@ -471,11 +471,7 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
         "quiet": True,
         "no_warnings": True,
         "geo_bypass": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android_sdkless", "mediaconnect", "web"],
-            }
-        },
+        "js_runtimes": {"node": {}, "deno": {}},
     }
 
     if ffmpeg_path:
@@ -584,11 +580,7 @@ def _download_audio_sync(url: str) -> AudioData:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android_sdkless", "mediaconnect", "web"],
-            }
-        },
+        "js_runtimes": {"node": {}, "deno": {}},
     }
 
     if ffmpeg_path:
