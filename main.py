@@ -315,10 +315,10 @@ async def _prepare_and_cache_video_for_inline(
                             storage.set_fallback_storage_chat_id(target_chat)
                         try:
                             await temp_msg.delete()
-                        except TelegramBadRequest:
+                        except Exception:
                             pass
                         return storage.get_cached_media(url), None
-                except TelegramBadRequest as exc:
+                except Exception as exc:
                     logger.warning("Could not upload temp inline video to chat %s: %s", target_chat, exc)
                     continue
 
@@ -938,7 +938,12 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
                 caption = fallback_video_data.caption or build_caption(
                     url, fallback_video_data.title, fallback_video_data.author
                 )
-                thumb = fallback_video_data.thumbnail_url or "https://www.tikwm.com/favicon.ico"
+                raw_thumb = fallback_video_data.thumbnail_url or ""
+                thumb = (
+                    raw_thumb
+                    if (".jpg" in raw_thumb.lower() or ".jpeg" in raw_thumb.lower())
+                    else "https://picsum.photos/320/320.jpg"
+                )
                 direct_result = InlineQueryResultVideo(
                     id=result_id,
                     video_url=fallback_video_data.direct_video_url,

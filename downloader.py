@@ -42,6 +42,11 @@ ANY_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+REDIRECT_NEEDED_PATTERN = re.compile(
+    r"https?://(?:(?:www\.)?instagram\.com/share/|instagr\.am/|vm\.tiktok\.com/|vt\.tiktok\.com/|(?:www\.)?tiktok\.com/t/|pin\.it/|fb\.watch/|t\.co/)",
+    re.IGNORECASE,
+)
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -134,6 +139,37 @@ def extract_all_video_urls(
             if len(seen) >= max_urls:
                 break
     return seen
+
+
+def _resolve_share_redirects(url: str) -> str:
+    if not REDIRECT_NEEDED_PATTERN.search(url):
+        return url
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        resp = cffi_requests.get(
+            url,
+            impersonate="chrome",
+            allow_redirects=True,
+            timeout=10,
+            stream=True,
+        )
+        final_url = str(resp.url)
+        resp.close()
+        if final_url and final_url.startswith("http") and "/accounts/login" not in final_url:
+            return final_url
+    except Exception:
+        pass
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            final_url = resp.geturl()
+            if final_url and final_url.startswith("http") and "/accounts/login" not in final_url:
+                return final_url
+    except Exception:
+        pass
+    return url
 
 
 def is_regular_youtube_url(url: str) -> bool:
@@ -414,9 +450,10 @@ def render_slideshow_to_video_sync(video_data: VideoData) -> Path | None:
 def _download_sync(url: str, max_height: int | None = None) -> VideoData:
     unique_id = uuid.uuid4().hex[:12]
     ffmpeg_path = _resolve_ffmpeg_path()
+    resolved_url = _resolve_share_redirects(url)
 
-    if "tiktok.com" in url.lower() and "/photo/" in url.lower():
-        tikwm_res = _try_tikwm_fallback(url, unique_id, ffmpeg_path)
+    if "tiktok.com" in resolved_url.lower():
+        tikwm_res = _try_tikwm_fallback(resolved_url, unique_id, ffmpeg_path)
         if tikwm_res:
             return tikwm_res
 
@@ -426,12 +463,7 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
 
     ydl_opts: dict = {
         "outtmpl": output_template,
-        "format": (
-            f"bestvideo{height_filter}[ext=mp4][filesize<45M]+bestaudio[ext=m4a]/"
-            f"best{height_filter}[ext=mp4][filesize<49M]/"
-            f"bestvideo[height<={min(target_res, 720)}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"best{height_filter}[ext=mp4]/best"
-        ),
+        "format": f"bestvideo{height_filter}+bestaudio/best{height_filter}/best",
         "format_sort": ["vcodec:h264", "acodec:m4a", "ext:mp4:m4a", f"res:{target_res}"],
         "merge_output_format": "mp4",
         "max_filesize": MAX_RAW_DOWNLOAD_BYTES,
@@ -439,7 +471,11 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
         "quiet": True,
         "no_warnings": True,
         "geo_bypass": True,
-        "http_headers": {"User-Agent": USER_AGENT},
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android_vr", "web"],
+            }
+        },
     }
 
     if ffmpeg_path:
@@ -449,19 +485,12 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(resolved_url, download=True)
             if not info:
                 raise DownloadError("Could not extract video information.")
 
             if "entries" in info and info["entries"]:
                 info = info["entries"][0]
-
-            if info.get("vcodec") == "none" and "tiktok.com" in url.lower():
-                for leftover in DOWNLOAD_DIR.glob(f"{unique_id}.*"):
-                    leftover.unlink(missing_ok=True)
-                tikwm_res = _try_tikwm_fallback(url, unique_id, ffmpeg_path)
-                if tikwm_res:
-                    return tikwm_res
 
             downloaded_str = ydl.prepare_filename(info)
             downloaded_path = Path(downloaded_str)
@@ -482,7 +511,13 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
             duration = info.get("duration")
             dur_int = int(round(duration)) if isinstance(duration, (int, float)) else None
             thumb = info.get("thumbnail")
+
             direct_url = info.get("url") if info.get("ext") == "mp4" else None
+            if not direct_url and isinstance(info.get("formats"), list):
+                for fmt in reversed(info["formats"]):
+                    if fmt.get("ext") == "mp4" and fmt.get("vcodec") != "none" and fmt.get("acodec") != "none":
+                        direct_url = fmt.get("url")
+                        break
 
             downloaded_path = _compress_video_if_needed(downloaded_path, dur_int, ffmpeg_path)
 
@@ -501,10 +536,6 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
         for leftover in DOWNLOAD_DIR.glob(f"{unique_id}.*"):
             leftover.unlink(missing_ok=True)
 
-        tikwm_res = _try_tikwm_fallback(url, unique_id, ffmpeg_path)
-        if tikwm_res:
-            return tikwm_res
-
         if isinstance(exc, DownloadError):
             raise
         raise DownloadError(f"Download failed: {exc}") from exc
@@ -513,15 +544,51 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
 def _download_audio_sync(url: str) -> AudioData:
     unique_id = uuid.uuid4().hex[:12]
     ffmpeg_path = _resolve_ffmpeg_path()
-    output_template = str(DOWNLOAD_DIR / f"{unique_id}_audio.%(ext)s")
+    resolved_url = _resolve_share_redirects(url)
 
+    if "tiktok.com" in resolved_url.lower():
+        tikwm = _try_tikwm_fallback(resolved_url, unique_id, ffmpeg_path)
+        if tikwm:
+            if tikwm.audio_path and tikwm.audio_path.exists():
+                for img in tikwm.image_paths:
+                    img.unlink(missing_ok=True)
+                return AudioData(
+                    file_path=tikwm.audio_path,
+                    title=tikwm.title[:100],
+                    performer=tikwm.author[:80],
+                )
+            if tikwm.file_path and tikwm.file_path.exists() and ffmpeg_path:
+                mp3_out = DOWNLOAD_DIR / f"{unique_id}_extracted.mp3"
+                try:
+                    subprocess.run(
+                        [ffmpeg_path, "-y", "-i", str(tikwm.file_path), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3_out)],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=60,
+                    )
+                    tikwm.cleanup()
+                    return AudioData(
+                        file_path=mp3_out,
+                        title=tikwm.title[:100],
+                        performer=tikwm.author[:80],
+                    )
+                except Exception:
+                    mp3_out.unlink(missing_ok=True)
+            tikwm.cleanup()
+
+    output_template = str(DOWNLOAD_DIR / f"{unique_id}_audio.%(ext)s")
     ydl_opts: dict = {
         "outtmpl": output_template,
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "http_headers": {"User-Agent": USER_AGENT},
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android_vr", "web"],
+            }
+        },
     }
 
     if ffmpeg_path:
@@ -539,7 +606,7 @@ def _download_audio_sync(url: str) -> AudioData:
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(resolved_url, download=True)
             if not info:
                 raise DownloadError("Could not extract audio track.")
             if "entries" in info and info["entries"]:
@@ -567,38 +634,6 @@ def _download_audio_sync(url: str) -> AudioData:
     except Exception as exc:
         for leftover in DOWNLOAD_DIR.glob(f"{unique_id}_audio.*"):
             leftover.unlink(missing_ok=True)
-
-        if "tiktok.com" in url.lower():
-            tikwm = _try_tikwm_fallback(url, unique_id, ffmpeg_path)
-            if tikwm:
-                if tikwm.audio_path and tikwm.audio_path.exists():
-                    for img in tikwm.image_paths:
-                        img.unlink(missing_ok=True)
-                    return AudioData(
-                        file_path=tikwm.audio_path,
-                        title=tikwm.title[:100],
-                        performer=tikwm.author[:80],
-                    )
-                if tikwm.file_path and tikwm.file_path.exists() and ffmpeg_path:
-                    mp3_out = DOWNLOAD_DIR / f"{unique_id}_extracted.mp3"
-                    try:
-                        subprocess.run(
-                            [ffmpeg_path, "-y", "-i", str(tikwm.file_path), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3_out)],
-                            check=True,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            timeout=60,
-                        )
-                        tikwm.cleanup()
-                        return AudioData(
-                            file_path=mp3_out,
-                            title=tikwm.title[:100],
-                            performer=tikwm.author[:80],
-                        )
-                    except Exception:
-                        mp3_out.unlink(missing_ok=True)
-                tikwm.cleanup()
-
         raise DownloadError(f"Could not extract audio: {exc}") from exc
 
 
@@ -744,7 +779,8 @@ async def update_ytdlp_package() -> tuple[bool, str]:
         "pip",
         "install",
         "--upgrade",
-        "yt-dlp",
+        "yt-dlp[default]",
+        "curl_cffi",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
