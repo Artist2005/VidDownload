@@ -961,11 +961,11 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
             )
             cached_media, fallback_video_data = await asyncio.wait_for(
                 asyncio.shield(prep_task),
-                timeout=6.0,
+                timeout=8.5,
             )
         except asyncio.TimeoutError:
             fallback_video_data = fallback_video_data or get_fast_meta(url)
-            logger.info("Inline download exceeded 6.0s timeout for %s, using fast meta or placeholder", url)
+            logger.info("Inline download exceeded 8.5s timeout for %s, using fast meta or placeholder", url)
         except Exception as exc:
             logger.warning("Inline direct download failed for %s: %s", url, exc)
 

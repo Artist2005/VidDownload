@@ -204,20 +204,35 @@ def _resolve_share_redirects(url: str) -> str:
     try:
         from curl_cffi import requests as cffi_requests
 
-        # 1. Fast single-hop check with bot User-Agent (resolves Instagram /share/ directly without login bounce)
-        resp_bot = cffi_requests.get(
-            url,
-            headers={"User-Agent": "TelegramBot (like TwitterBot)"},
-            allow_redirects=False,
-            timeout=5,
-        )
-        loc_bot = _extract_clean_redirect_url(resp_bot.headers.get("location"))
-        if loc_bot and "/share/" not in loc_bot and not REDIRECT_NEEDED_PATTERN.search(loc_bot):
-            return loc_bot
+        # 1. Follow up to 4 hops with crawler User-Agent (resolves Instagram /share/ directly without login bounce)
+        curr = url
+        for _ in range(4):
+            resp_bot = cffi_requests.get(
+                curr,
+                headers={"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"},
+                allow_redirects=False,
+                timeout=5,
+            )
+            loc_bot = _extract_clean_redirect_url(resp_bot.headers.get("location"))
+            if loc_bot and loc_bot != curr:
+                if "/share/" not in loc_bot and not REDIRECT_NEEDED_PATTERN.search(loc_bot):
+                    return loc_bot
+                curr = loc_bot
+                continue
+            if resp_bot.status_code == 200 and resp_bot.text:
+                m_canon = re.search(
+                    r'(?:property=["\']og:url["\']\s+content|rel=["\']canonical["\']\s+href)=["\'](https?://[^"\']+)["\']',
+                    resp_bot.text,
+                    re.IGNORECASE,
+                )
+                if m_canon:
+                    canon_url = _extract_clean_redirect_url(html.unescape(m_canon.group(1)))
+                    if canon_url and "/share/" not in canon_url:
+                        return canon_url
+            break
 
-        # 2. Follow up to 2 redirect hops with Chrome impersonation
-        curr = loc_bot or url
-        for _ in range(2):
+        # 2. Follow up to 3 redirect hops with Chrome impersonation
+        for _ in range(3):
             resp_hop = cffi_requests.get(
                 curr,
                 impersonate="chrome",
@@ -579,6 +594,30 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
         if u and isinstance(u, str) and u.startswith("http") and u not in candidate_video_urls:
             candidate_video_urls.append(u)
 
+    def _try_download_candidate(cand_url: str | None) -> VideoData | None:
+        if not cand_url or not isinstance(cand_url, str) or not cand_url.startswith("http"):
+            return None
+        dur_int = int(round(duration)) if isinstance(duration, (int, float)) else None
+        video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
+        try:
+            _download_cffi_or_urllib(cand_url, video_dest)
+            if video_dest.exists() and video_dest.stat().st_size > 1000:
+                video_dest = _compress_video_if_needed(video_dest, dur_int, ffmpeg_path)
+                return VideoData(
+                    file_path=video_dest,
+                    title=title[:200],
+                    author=author[:100],
+                    caption=build_caption(url, title=title, author=author),
+                    width=width,
+                    height=height,
+                    duration=dur_int,
+                    direct_video_url=None,
+                    thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
+                )
+        except Exception:
+            video_dest.unlink(missing_ok=True)
+        return None
+
     try:
         from curl_cffi import requests as cffi_requests
 
@@ -635,30 +674,43 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
         except Exception:
             pass
 
-        # 2. Only call kkinstagram if Embed page did not yield a direct video URL
-        if not candidate_video_urls and not slide_image_urls:
+        # If single video candidate found from Embed page, try downloading it right away
+        if candidate_video_urls and len(slide_video_urls) <= 1 and not (slide_video_urls and slide_image_urls):
+            for cand in list(candidate_video_urls):
+                res = _try_download_candidate(cand)
+                if res:
+                    return res
+            candidate_video_urls.clear()
+
+        # 2. Try kkinstagram if Embed page did not yield a working video download
+        if not slide_image_urls and len(slide_video_urls) <= 1:
             try:
                 kk_resp = cffi_requests.get(
                     f"https://www.kkinstagram.com/reel/{shortcode}/",
                     headers={"User-Agent": "TelegramBot (like TwitterBot)"},
                     allow_redirects=False,
-                    timeout=5,
+                    timeout=6,
                 )
+                kk_cand = None
                 loc = kk_resp.headers.get("location")
                 if loc and loc.startswith("http") and (".mp4" in loc or "fbcdn.net" in loc or "cdninstagram.com" in loc):
-                    _add_candidate(loc)
+                    kk_cand = loc
                 elif kk_resp.status_code == 200 and kk_resp.text:
                     og_m = re.search(
                         r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
                         kk_resp.text,
                     )
                     if og_m:
-                        _add_candidate(html.unescape(og_m.group(1)))
+                        kk_cand = html.unescape(og_m.group(1))
+                if kk_cand:
+                    res = _try_download_candidate(kk_cand)
+                    if res:
+                        return res
             except Exception:
                 pass
 
-        # 3. Try vxinstagram offload MP4 if no candidates found yet
-        if not candidate_video_urls and not slide_image_urls:
+        # 3. Try vxinstagram offload MP4 if still no working video download
+        if not slide_image_urls and len(slide_video_urls) <= 1:
             try:
                 vx_resp = cffi_requests.get(
                     f"https://www.vxinstagram.com/reel/{shortcode}/",
@@ -667,12 +719,6 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                     timeout=7,
                 )
                 if vx_resp.status_code == 200 and vx_resp.text:
-                    og_m = re.search(
-                        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
-                        vx_resp.text,
-                    )
-                    if og_m:
-                        _add_candidate(html.unescape(og_m.group(1)))
                     if not thumb_url:
                         img_m = re.search(
                             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
@@ -680,6 +726,14 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                         )
                         if img_m:
                             thumb_url = html.unescape(img_m.group(1))
+                    og_m = re.search(
+                        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+                        vx_resp.text,
+                    )
+                    if og_m:
+                        res = _try_download_candidate(html.unescape(og_m.group(1)))
+                        if res:
+                            return res
             except Exception:
                 pass
     except Exception:
@@ -687,19 +741,6 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
 
     caption = build_caption(url, title=title, author=author)
     dur_int = int(round(duration)) if isinstance(duration, (int, float)) else None
-
-    if candidate_video_urls:
-        FAST_META_CACHE[url] = VideoData(
-            file_path=None,
-            title=title[:200],
-            author=author[:100],
-            caption=caption,
-            width=width,
-            height=height,
-            duration=dur_int,
-            direct_video_url=candidate_video_urls[0],
-            thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
-        )
 
     # Multi-video or mixed carousel post
     if len(slide_video_urls) > 1 or (slide_video_urls and slide_image_urls):
@@ -733,30 +774,14 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                 duration=dur_int,
                 video_paths=video_paths,
                 image_paths=image_paths,
-                direct_video_url=slide_video_urls[0],
+                direct_video_url=None,
                 thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
             )
 
     for cand_url in candidate_video_urls:
-        video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
-        try:
-            _download_cffi_or_urllib(cand_url, video_dest)
-            if video_dest.exists() and video_dest.stat().st_size > 1000:
-                video_dest = _compress_video_if_needed(video_dest, dur_int, ffmpeg_path)
-                return VideoData(
-                    file_path=video_dest,
-                    title=title[:200],
-                    author=author[:100],
-                    caption=caption,
-                    width=width,
-                    height=height,
-                    duration=dur_int,
-                    direct_video_url=cand_url,
-                    thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
-                )
-        except Exception:
-            video_dest.unlink(missing_ok=True)
-            continue
+        res = _try_download_candidate(cand_url)
+        if res:
+            return res
 
     if slide_image_urls:
         image_paths = []
@@ -1018,7 +1043,9 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
                     if fmt.get("ext") == "mp4" and fmt.get("vcodec") != "none" and fmt.get("acodec") != "none":
                         direct_url = fmt.get("url")
                         break
-            if direct_url and ("googlevideo.com" in direct_url or ".m3u8" in direct_url):
+            if direct_url and any(
+                bad in direct_url for bad in ("googlevideo.com", ".m3u8", "fbcdn.net", "cdninstagram.com")
+            ):
                 direct_url = None
 
             downloaded_path = _compress_video_if_needed(downloaded_path, dur_int, ffmpeg_path)
