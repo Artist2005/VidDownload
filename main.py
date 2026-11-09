@@ -948,7 +948,6 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
     platform = detect_platform_name(url)
     result_id = storage.register_url(url)
     cached_media = storage.get_cached_media(url)
-    fallback_video_data: VideoData | None = None
 
     if not cached_media:
         try:
@@ -959,13 +958,12 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
                     inline_query.from_user.id,
                 )
             )
-            cached_media, fallback_video_data = await asyncio.wait_for(
+            cached_media, _ = await asyncio.wait_for(
                 asyncio.shield(prep_task),
-                timeout=8.5,
+                timeout=9.0,
             )
         except asyncio.TimeoutError:
-            fallback_video_data = fallback_video_data or get_fast_meta(url)
-            logger.info("Inline download exceeded 8.5s timeout for %s, using fast meta or placeholder", url)
+            logger.info("Inline download exceeded 9.0s timeout for %s, falling back to placeholder card", url)
         except Exception as exc:
             logger.warning("Inline direct download failed for %s: %s", url, exc)
 
@@ -981,42 +979,10 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
             reply_markup=_video_keyboard(result_id, url),
         )
         try:
-            await inline_query.answer([cached_video], cache_time=300, is_personal=False)
+            await inline_query.answer([cached_video], cache_time=5, is_personal=False)
             return
         except TelegramBadRequest as exc:
             logger.warning("Inline answer with cached_video failed for %s: %s", url, exc)
-
-    if fallback_video_data and fallback_video_data.direct_video_url:
-        caption = fallback_video_data.caption or build_caption(
-            url,
-            fallback_video_data.title,
-            fallback_video_data.author,
-        )
-        raw_thumb = fallback_video_data.thumbnail_url or ""
-        thumb = (
-            raw_thumb
-            if (".jpg" in raw_thumb.lower() or ".jpeg" in raw_thumb.lower())
-            else "https://picsum.photos/320/320.jpg"
-        )
-        direct_video = InlineQueryResultVideo(
-            id=f"direct_{result_id}",
-            video_url=fallback_video_data.direct_video_url,
-            mime_type="video/mp4",
-            thumbnail_url=thumb,
-            title=f"Send Video from {platform}",
-            description=fallback_video_data.title or url,
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-            video_width=fallback_video_data.width,
-            video_height=fallback_video_data.height,
-            video_duration=fallback_video_data.duration,
-            reply_markup=_video_keyboard(result_id, url),
-        )
-        try:
-            await inline_query.answer([direct_video], cache_time=60, is_personal=False)
-            return
-        except TelegramBadRequest as exc:
-            logger.warning("Inline answer with direct_video failed for %s: %s", url, exc)
 
     download_article = InlineQueryResultArticle(
         id=f"load_{result_id}",

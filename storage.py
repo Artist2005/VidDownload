@@ -78,12 +78,15 @@ class BotStorage:
         self._locks: dict[str, asyncio.Lock] = {}
         self._load()
 
+    SCHEMA_VERSION = 3
+
     def _load(self) -> None:
         if not self.cache_path.exists():
             return
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
-            raw_files = data.get("file_cache", {})
+            schema_ver = data.get("schema_version", 1)
+            raw_files = data.get("file_cache", {}) if schema_ver == self.SCHEMA_VERSION else {}
             for url, val in raw_files.items():
                 if isinstance(val, str):
                     self.media_cache[url] = CachedMedia(file_id=val)
@@ -114,6 +117,8 @@ class BotStorage:
             if isinstance(raw_chat_id, int):
                 self.fallback_storage_chat_id = raw_chat_id
             self.total_downloads = int(data.get("total_downloads", len(self.media_cache)))
+            if schema_ver != self.SCHEMA_VERSION:
+                self._save()
         except Exception:
             self.media_cache = {}
             self.audio_only_cache = {}
@@ -144,6 +149,7 @@ class BotStorage:
             for chat_key, cfg in self.chat_settings.items()
         }
         data = {
+            "schema_version": self.SCHEMA_VERSION,
             "file_cache": serializable_cache,
             "audio_only_cache": self.audio_only_cache,
             "video_note_cache": self.video_note_cache,

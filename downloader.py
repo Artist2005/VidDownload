@@ -94,14 +94,14 @@ class VideoData:
     thumbnail_url: str | None = None
 
     def __post_init__(self) -> None:
-        if (self.width is None or self.height is None) and self.file_path and self.file_path.exists():
+        if self.file_path and self.file_path.exists():
             ffmpeg_path = _resolve_ffmpeg_path()
             if ffmpeg_path:
                 _, _, p_w, p_h, p_dur = _probe_video_stream_info(self.file_path, ffmpeg_path)
                 if p_w and p_h:
                     self.width = p_w
                     self.height = p_h
-                if p_dur and not self.duration:
+                if p_dur:
                     self.duration = p_dur
 
     def cleanup(self) -> None:
@@ -325,15 +325,26 @@ def cleanup_old_downloads(max_age_seconds: int = DOWNLOAD_FILE_TTL_SECONDS) -> i
     return removed
 
 
+_FFMPEG_PATH_CACHE: str | None = None
+
+
 def _resolve_ffmpeg_path() -> str | None:
-    system_ffmpeg = shutil.which("ffmpeg")
-    if system_ffmpeg:
-        return system_ffmpeg
+    global _FFMPEG_PATH_CACHE
+    if _FFMPEG_PATH_CACHE:
+        return _FFMPEG_PATH_CACHE
     try:
         import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe:
+            _FFMPEG_PATH_CACHE = exe
+            return exe
     except Exception:
-        return None
+        pass
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        _FFMPEG_PATH_CACHE = system_ffmpeg
+        return system_ffmpeg
+    return None
 
 
 def _probe_video_stream_info(
@@ -364,7 +375,7 @@ def _probe_video_stream_info(
 
         vcodec = m_vid.group(1).lower()
         rest = m_vid.group(2)
-        pix_fmt = "yuv420p" if ("yuv420p" in rest and "yuv420p10" not in rest) else "other"
+        pix_fmt = "yuv420p" if ("yuv420p" in rest and "yuv420p10" not in rest and "yuvj420p" not in rest) else "other"
 
         width: int | None = None
         height: int | None = None
@@ -383,41 +394,119 @@ def _compress_video_if_needed(
     duration: int | None,
     ffmpeg_path: str | None,
 ) -> Path:
-    if not file_path.exists() or file_path.stat().st_size <= MAX_FILESIZE_BYTES:
+    if not file_path.exists():
         return file_path
 
+    size_bytes = file_path.stat().st_size
     if not ffmpeg_path:
-        file_path.unlink(missing_ok=True)
-        raise DownloadError("Video exceeds 50 MB and ffmpeg is unavailable for compression.")
+        if size_bytes > MAX_FILESIZE_BYTES:
+            file_path.unlink(missing_ok=True)
+            raise DownloadError("Video exceeds 50 MB and ffmpeg is unavailable for compression.")
+        return file_path
 
-    _, _, _, _, probed_dur = _probe_video_stream_info(file_path, ffmpeg_path)
+    vcodec, pix_fmt, p_w, p_h, probed_dur = _probe_video_stream_info(file_path, ffmpeg_path)
+    if not vcodec:
+        file_path.unlink(missing_ok=True)
+        raise DownloadError("Downloaded file does not contain a valid video stream.")
+
+    odd_dims = bool((p_w and p_w % 2 != 0) or (p_h and p_h % 2 != 0))
+    needs_size_compression = size_bytes > MAX_FILESIZE_BYTES
+    needs_codec_transcode = vcodec != "h264" or pix_fmt != "yuv420p" or odd_dims
+
+    # Fast lossless video remux for H.264 (yuv420p) videos <= 49 MB:
+    # converts HE-AAC / xHE-AAC / Opus audio to standard AAC-LC and writes a clean +faststart MP4 container
+    if not needs_size_compression and not needs_codec_transcode:
+        remuxed_path = file_path.with_name(f"{file_path.stem}_faststart.mp4")
+        remux_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(file_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "copy",
+            "-tag:v",
+            "avc1",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            str(remuxed_path),
+        ]
+        try:
+            subprocess.run(remux_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            if remuxed_path.exists() and 1000 < remuxed_path.stat().st_size <= MAX_FILESIZE_BYTES:
+                file_path.unlink(missing_ok=True)
+                return remuxed_path
+            remuxed_path.unlink(missing_ok=True)
+        except Exception:
+            remuxed_path.unlink(missing_ok=True)
+
     dur = max(duration or probed_dur or 60, 5)
     target_total_kbps = max(250, int((44 * 8192) / dur))
-    audio_kbps = 96
+    audio_kbps = 96 if needs_size_compression else 128
     video_kbps = max(150, target_total_kbps - audio_kbps)
 
     compressed_path = file_path.with_name(f"{file_path.stem}_compressed.mp4")
+    scale_filter = (
+        "scale='min(720,iw)':-2,format=yuv420p"
+        if needs_size_compression
+        else "scale='trunc(min(1080,iw)/2)*2':'trunc(min(1920,ih)/2)*2',format=yuv420p"
+    )
     cmd = [
         ffmpeg_path,
         "-y",
         "-i",
         str(file_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
         "-vf",
-        "scale='min(720,iw)':-2,format=yuv420p",
+        scale_filter,
         "-c:v",
         "libx264",
+        "-profile:v",
+        "high",
+        "-level",
+        "4.1",
+        "-pix_fmt",
+        "yuv420p",
+        "-tag:v",
+        "avc1",
         "-preset",
-        "veryfast",
-        "-b:v",
-        f"{video_kbps}k",
-        "-maxrate",
-        f"{int(video_kbps * 1.2)}k",
-        "-bufsize",
-        f"{video_kbps * 2}k",
+        "ultrafast",
+    ]
+    if needs_size_compression:
+        cmd += [
+            "-b:v",
+            f"{video_kbps}k",
+            "-maxrate",
+            f"{int(video_kbps * 1.2)}k",
+            "-bufsize",
+            f"{video_kbps * 2}k",
+        ]
+    else:
+        cmd += ["-crf", "23"]
+
+    cmd += [
         "-c:a",
         "aac",
         "-b:a",
         f"{audio_kbps}k",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
         "-movflags",
         "+faststart",
         str(compressed_path),
@@ -427,7 +516,7 @@ def _compress_video_if_needed(
     except Exception as exc:
         compressed_path.unlink(missing_ok=True)
         file_path.unlink(missing_ok=True)
-        raise DownloadError("Video exceeds 50 MB and automatic compression failed.") from exc
+        raise DownloadError("Video format conversion failed.") from exc
 
     file_path.unlink(missing_ok=True)
     if not compressed_path.exists() or compressed_path.stat().st_size > MAX_FILESIZE_BYTES:
@@ -514,27 +603,11 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
             )
 
     play_url = data.get("play") or data.get("wmplay")
-    video_id = data.get("id")
-    clean_direct_url = (
-        f"https://www.tikwm.com/video/media/play/{video_id}.mp4"
-        if video_id
-        else (play_url if str(play_url).startswith("http") else None)
-    )
     if play_url:
         dur_int = int(duration) if isinstance(duration, (int, float)) else None
-        if clean_direct_url:
-            FAST_META_CACHE[url] = VideoData(
-                file_path=None,
-                title=title[:200],
-                author=author,
-                caption=caption,
-                duration=dur_int,
-                direct_video_url=clean_direct_url,
-                thumbnail_url=cover_url if str(cover_url).startswith("http") else None,
-            )
         video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
         try:
-            _download_file(play_url, video_dest)
+            _download_cffi_or_urllib(play_url, video_dest)
             video_dest = _compress_video_if_needed(
                 video_dest,
                 dur_int,
@@ -546,7 +619,7 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
                 author=author,
                 caption=caption,
                 duration=dur_int,
-                direct_video_url=clean_direct_url,
+                direct_video_url=None,
                 thumbnail_url=cover_url if str(cover_url).startswith("http") else None,
             )
         except Exception:
