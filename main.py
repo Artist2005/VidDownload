@@ -264,7 +264,6 @@ async def _prepare_and_cache_video_for_inline(
     url: str,
     bot: Bot,
     user_id: int,
-    upload_timeout: float | None = None,
 ) -> tuple[CachedMedia | None, VideoData | None]:
     async with storage.get_lock(url):
         cached = storage.get_cached_media(url)
@@ -335,18 +334,9 @@ async def _prepare_and_cache_video_for_inline(
                         continue
                 return None
 
-            if upload_timeout and video_data.direct_video_url:
-                try:
-                    uploaded_media = await asyncio.wait_for(_try_upload_to_candidates(), timeout=upload_timeout)
-                    if uploaded_media:
-                        return uploaded_media, None
-                except asyncio.TimeoutError:
-                    logger.info("Inline upload exceeded %.1fs, returning direct_video_url for %s", upload_timeout, url)
-                    return None, video_data
-            else:
-                uploaded_media = await _try_upload_to_candidates()
-                if uploaded_media:
-                    return uploaded_media, None
+            uploaded_media = await _try_upload_to_candidates()
+            if uploaded_media:
+                return uploaded_media, None
 
             return None, video_data
         finally:
@@ -965,41 +955,14 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
                     url,
                     bot,
                     inline_query.from_user.id,
-                    upload_timeout=4.5,
                 )
             )
-            cached_media, fallback_video_data = await asyncio.wait_for(
+            cached_media, _ = await asyncio.wait_for(
                 asyncio.shield(prep_task),
-                timeout=9.0,
+                timeout=9.2,
             )
-            if not cached_media and fallback_video_data and fallback_video_data.direct_video_url:
-                caption = fallback_video_data.caption or build_caption(
-                    url, fallback_video_data.title, fallback_video_data.author
-                )
-                raw_thumb = fallback_video_data.thumbnail_url or ""
-                thumb = (
-                    raw_thumb
-                    if (".jpg" in raw_thumb.lower() or ".jpeg" in raw_thumb.lower())
-                    else "https://picsum.photos/320/320.jpg"
-                )
-                direct_result = InlineQueryResultVideo(
-                    id=result_id,
-                    video_url=fallback_video_data.direct_video_url,
-                    mime_type="video/mp4",
-                    thumbnail_url=thumb,
-                    title=f"Send Video from {platform}",
-                    description=fallback_video_data.title or url,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    video_width=fallback_video_data.width,
-                    video_height=fallback_video_data.height,
-                    video_duration=fallback_video_data.duration,
-                    reply_markup=_video_keyboard(result_id, url),
-                )
-                await inline_query.answer([direct_result], cache_time=60, is_personal=False)
-                return
         except asyncio.TimeoutError:
-            logger.info("Inline download exceeded 9s timeout for %s, falling back to placeholder card", url)
+            logger.info("Inline download exceeded 9.2s timeout for %s, falling back to placeholder card", url)
         except Exception as exc:
             logger.warning("Inline direct download failed for %s: %s", url, exc)
 

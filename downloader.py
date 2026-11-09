@@ -82,6 +82,17 @@ class VideoData:
     direct_video_url: str | None = None
     thumbnail_url: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.file_path and self.file_path.exists():
+            ffmpeg_path = _resolve_ffmpeg_path()
+            if ffmpeg_path:
+                _, _, p_w, p_h, p_dur = _probe_video_stream_info(self.file_path, ffmpeg_path)
+                if p_w and p_h:
+                    self.width = p_w
+                    self.height = p_h
+                if p_dur:
+                    self.duration = p_dur
+
     def cleanup(self) -> None:
         if self.file_path and self.file_path.exists():
             self.file_path.unlink(missing_ok=True)
@@ -304,41 +315,130 @@ def _resolve_ffmpeg_path() -> str | None:
         return None
 
 
+def _probe_video_stream_info(
+    file_path: Path,
+    ffmpeg_path: str | None,
+) -> tuple[str, str, int | None, int | None, int | None]:
+    if not ffmpeg_path or not file_path.exists():
+        return "", "", None, None, None
+    try:
+        proc = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-i", str(file_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=15,
+        )
+        info_txt = proc.stderr or ""
+        dur_int: int | None = None
+        m_dur = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", info_txt)
+        if m_dur:
+            secs = int(m_dur.group(1)) * 3600 + int(m_dur.group(2)) * 60 + float(m_dur.group(3))
+            dur_int = max(1, int(round(secs)))
+
+        m_vid = re.search(r"Stream #\d+:\d+[^\n]*Video:\s*([a-zA-Z0-9_]+)([^\n]*)", info_txt)
+        if not m_vid:
+            return "", "", None, None, dur_int
+
+        vcodec = m_vid.group(1).lower()
+        rest = m_vid.group(2)
+        pix_fmt = "yuv420p" if ("yuv420p" in rest and "yuv420p10" not in rest) else "other"
+
+        width: int | None = None
+        height: int | None = None
+        m_res = re.search(r",\s*(\d{2,5})x(\d{2,5})(?:[\s,\[])", rest)
+        if m_res:
+            width = int(m_res.group(1))
+            height = int(m_res.group(2))
+
+        return vcodec, pix_fmt, width, height, dur_int
+    except Exception:
+        return "", "", None, None, None
+
+
 def _compress_video_if_needed(
     file_path: Path,
     duration: int | None,
     ffmpeg_path: str | None,
 ) -> Path:
-    if not file_path.exists() or file_path.stat().st_size <= MAX_FILESIZE_BYTES:
+    if not file_path.exists():
         return file_path
 
+    size_bytes = file_path.stat().st_size
     if not ffmpeg_path:
-        file_path.unlink(missing_ok=True)
-        raise DownloadError("Video exceeds 50 MB and ffmpeg is unavailable for compression.")
+        if size_bytes > MAX_FILESIZE_BYTES:
+            file_path.unlink(missing_ok=True)
+            raise DownloadError("Video exceeds 50 MB and ffmpeg is unavailable for compression.")
+        return file_path
 
-    dur = max(duration or 60, 5)
+    vcodec, pix_fmt, _, _, probed_dur = _probe_video_stream_info(file_path, ffmpeg_path)
+    if not vcodec:
+        file_path.unlink(missing_ok=True)
+        raise DownloadError("Downloaded file does not contain a valid video stream.")
+
+    needs_size_compression = size_bytes > MAX_FILESIZE_BYTES
+    needs_codec_transcode = vcodec != "h264" or pix_fmt != "yuv420p"
+
+    # Fast lossless remux for H.264 videos <= 49 MB: fixes fragmented DASH containers, HE-AAC audio, and moov atom
+    if not needs_size_compression and not needs_codec_transcode:
+        remuxed_path = file_path.with_name(f"{file_path.stem}_faststart.mp4")
+        remux_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(file_path),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(remuxed_path),
+        ]
+        try:
+            subprocess.run(remux_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            if remuxed_path.exists() and remuxed_path.stat().st_size > 1000:
+                file_path.unlink(missing_ok=True)
+                return remuxed_path
+        except Exception:
+            remuxed_path.unlink(missing_ok=True)
+        return file_path
+
+    dur = max(duration or probed_dur or 60, 5)
     target_total_kbps = max(250, int((44 * 8192) / dur))
-    audio_kbps = 96
+    audio_kbps = 96 if needs_size_compression else 128
     video_kbps = max(150, target_total_kbps - audio_kbps)
 
     compressed_path = file_path.with_name(f"{file_path.stem}_compressed.mp4")
+    scale_filter = "scale='min(720,iw)':-2,format=yuv420p" if needs_size_compression else "scale='trunc(iw/2)*2':'trunc(ih/2)*2',format=yuv420p"
     cmd = [
         ffmpeg_path,
         "-y",
         "-i",
         str(file_path),
         "-vf",
-        "scale='min(720,iw)':-2",
+        scale_filter,
         "-c:v",
         "libx264",
         "-preset",
         "veryfast",
-        "-b:v",
-        f"{video_kbps}k",
-        "-maxrate",
-        f"{int(video_kbps * 1.2)}k",
-        "-bufsize",
-        f"{video_kbps * 2}k",
+    ]
+    if needs_size_compression:
+        cmd += [
+            "-b:v",
+            f"{video_kbps}k",
+            "-maxrate",
+            f"{int(video_kbps * 1.2)}k",
+            "-bufsize",
+            f"{video_kbps * 2}k",
+        ]
+    else:
+        cmd += ["-crf", "23"]
+
+    cmd += [
         "-c:a",
         "aac",
         "-b:a",
@@ -352,7 +452,7 @@ def _compress_video_if_needed(
     except Exception as exc:
         compressed_path.unlink(missing_ok=True)
         file_path.unlink(missing_ok=True)
-        raise DownloadError("Video exceeds 50 MB and automatic compression failed.") from exc
+        raise DownloadError("Video conversion failed.") from exc
 
     file_path.unlink(missing_ok=True)
     if not compressed_path.exists() or compressed_path.stat().st_size > MAX_FILESIZE_BYTES:
