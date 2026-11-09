@@ -64,6 +64,17 @@ USER_AGENT = (
 )
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+FAST_META_CACHE: dict[str, "VideoData"] = {}
+RESOLVED_URL_CACHE: dict[str, str] = {}
+
+
+def get_fast_meta(url: str) -> "VideoData | None":
+    if url in FAST_META_CACHE:
+        return FAST_META_CACHE[url]
+    resolved = RESOLVED_URL_CACHE.get(url)
+    if resolved and resolved in FAST_META_CACHE:
+        return FAST_META_CACHE[resolved]
+    return None
 
 
 @dataclass
@@ -83,14 +94,14 @@ class VideoData:
     thumbnail_url: str | None = None
 
     def __post_init__(self) -> None:
-        if self.file_path and self.file_path.exists():
+        if (self.width is None or self.height is None) and self.file_path and self.file_path.exists():
             ffmpeg_path = _resolve_ffmpeg_path()
             if ffmpeg_path:
                 _, _, p_w, p_h, p_dur = _probe_video_stream_info(self.file_path, ffmpeg_path)
                 if p_w and p_h:
                     self.width = p_w
                     self.height = p_h
-                if p_dur:
+                if p_dur and not self.duration:
                     self.duration = p_dur
 
     def cleanup(self) -> None:
@@ -193,40 +204,40 @@ def _resolve_share_redirects(url: str) -> str:
     try:
         from curl_cffi import requests as cffi_requests
 
-        # Follow up to 4 redirect hops with allow_redirects=False so we never download full bodies or use stream=True
-        curr = url
-        for _ in range(4):
+        # 1. Fast single-hop check with bot User-Agent (resolves Instagram /share/ directly without login bounce)
+        resp_bot = cffi_requests.get(
+            url,
+            headers={"User-Agent": "TelegramBot (like TwitterBot)"},
+            allow_redirects=False,
+            timeout=5,
+        )
+        loc_bot = _extract_clean_redirect_url(resp_bot.headers.get("location"))
+        if loc_bot and "/share/" not in loc_bot and not REDIRECT_NEEDED_PATTERN.search(loc_bot):
+            return loc_bot
+
+        # 2. Follow up to 2 redirect hops with Chrome impersonation
+        curr = loc_bot or url
+        for _ in range(2):
             resp_hop = cffi_requests.get(
                 curr,
                 impersonate="chrome",
                 allow_redirects=False,
-                timeout=8,
+                timeout=5,
             )
             loc_hop = _extract_clean_redirect_url(resp_hop.headers.get("location"))
-            if not loc_hop:
+            if not loc_hop or loc_hop == curr:
                 break
             if "/share/" not in loc_hop and not REDIRECT_NEEDED_PATTERN.search(loc_hop):
                 return loc_hop
             curr = loc_hop
         if curr != url and "/share/" not in curr:
             return curr
-
-        # Fallback with bot User-Agent which Instagram/TikTok often redirect cleanly for OG previews
-        resp_bot = cffi_requests.get(
-            url,
-            headers={"User-Agent": "TelegramBot (like TwitterBot)"},
-            allow_redirects=False,
-            timeout=8,
-        )
-        loc_bot = _extract_clean_redirect_url(resp_bot.headers.get("location"))
-        if loc_bot and "/share/" not in loc_bot:
-            return loc_bot
     except Exception:
         pass
 
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=6) as resp:
             final_url = _extract_clean_redirect_url(resp.geturl())
             if final_url:
                 return final_url
@@ -357,85 +368,37 @@ def _compress_video_if_needed(
     duration: int | None,
     ffmpeg_path: str | None,
 ) -> Path:
-    if not file_path.exists():
+    if not file_path.exists() or file_path.stat().st_size <= MAX_FILESIZE_BYTES:
         return file_path
 
-    size_bytes = file_path.stat().st_size
     if not ffmpeg_path:
-        if size_bytes > MAX_FILESIZE_BYTES:
-            file_path.unlink(missing_ok=True)
-            raise DownloadError("Video exceeds 50 MB and ffmpeg is unavailable for compression.")
-        return file_path
-
-    vcodec, pix_fmt, _, _, probed_dur = _probe_video_stream_info(file_path, ffmpeg_path)
-    if not vcodec:
-        if size_bytes <= MAX_FILESIZE_BYTES:
-            return file_path
         file_path.unlink(missing_ok=True)
-        raise DownloadError("Downloaded file does not contain a valid video stream.")
+        raise DownloadError("Video exceeds 50 MB and ffmpeg is unavailable for compression.")
 
-    needs_size_compression = size_bytes > MAX_FILESIZE_BYTES
-    needs_codec_transcode = vcodec not in ("h264", "avc1") or pix_fmt != "yuv420p"
-
-    # Fast lossless remux for H.264 videos <= 49 MB: fixes fragmented DASH containers, HE-AAC audio, and moov atom
-    if not needs_size_compression and not needs_codec_transcode:
-        remuxed_path = file_path.with_name(f"{file_path.stem}_faststart.mp4")
-        remux_cmd = [
-            ffmpeg_path,
-            "-y",
-            "-i",
-            str(file_path),
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            str(remuxed_path),
-        ]
-        try:
-            subprocess.run(remux_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-            if remuxed_path.exists() and remuxed_path.stat().st_size > 1000:
-                file_path.unlink(missing_ok=True)
-                return remuxed_path
-        except Exception:
-            remuxed_path.unlink(missing_ok=True)
-        return file_path
-
+    _, _, _, _, probed_dur = _probe_video_stream_info(file_path, ffmpeg_path)
     dur = max(duration or probed_dur or 60, 5)
     target_total_kbps = max(250, int((44 * 8192) / dur))
-    audio_kbps = 96 if needs_size_compression else 128
+    audio_kbps = 96
     video_kbps = max(150, target_total_kbps - audio_kbps)
 
     compressed_path = file_path.with_name(f"{file_path.stem}_compressed.mp4")
-    scale_filter = "scale='min(720,iw)':-2,format=yuv420p" if needs_size_compression else "scale='trunc(iw/2)*2':'trunc(ih/2)*2',format=yuv420p"
     cmd = [
         ffmpeg_path,
         "-y",
         "-i",
         str(file_path),
         "-vf",
-        scale_filter,
+        "scale='min(720,iw)':-2,format=yuv420p",
         "-c:v",
         "libx264",
         "-preset",
         "veryfast",
-    ]
-    if needs_size_compression:
-        cmd += [
-            "-b:v",
-            f"{video_kbps}k",
-            "-maxrate",
-            f"{int(video_kbps * 1.2)}k",
-            "-bufsize",
-            f"{video_kbps * 2}k",
-        ]
-    else:
-        cmd += ["-crf", "23"]
-
-    cmd += [
+        "-b:v",
+        f"{video_kbps}k",
+        "-maxrate",
+        f"{int(video_kbps * 1.2)}k",
+        "-bufsize",
+        f"{video_kbps * 2}k",
         "-c:a",
         "aac",
         "-b:a",
@@ -449,7 +412,7 @@ def _compress_video_if_needed(
     except Exception as exc:
         compressed_path.unlink(missing_ok=True)
         file_path.unlink(missing_ok=True)
-        raise DownloadError("Video conversion failed.") from exc
+        raise DownloadError("Video exceeds 50 MB and automatic compression failed.") from exc
 
     file_path.unlink(missing_ok=True)
     if not compressed_path.exists() or compressed_path.stat().st_size > MAX_FILESIZE_BYTES:
@@ -543,12 +506,23 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
         else (play_url if str(play_url).startswith("http") else None)
     )
     if play_url:
+        dur_int = int(duration) if isinstance(duration, (int, float)) else None
+        if clean_direct_url:
+            FAST_META_CACHE[url] = VideoData(
+                file_path=None,
+                title=title[:200],
+                author=author,
+                caption=caption,
+                duration=dur_int,
+                direct_video_url=clean_direct_url,
+                thumbnail_url=cover_url if str(cover_url).startswith("http") else None,
+            )
         video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
         try:
             _download_file(play_url, video_dest)
             video_dest = _compress_video_if_needed(
                 video_dest,
-                int(duration) if isinstance(duration, (int, float)) else None,
+                dur_int,
                 ffmpeg_path,
             )
             return VideoData(
@@ -556,7 +530,7 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
                 title=title[:200],
                 author=author,
                 caption=caption,
-                duration=int(duration) if isinstance(duration, (int, float)) else None,
+                duration=dur_int,
                 direct_video_url=clean_direct_url,
                 thumbnail_url=cover_url if str(cover_url).startswith("http") else None,
             )
@@ -570,7 +544,9 @@ def _download_cffi_or_urllib(url: str, dest: Path) -> None:
     try:
         from curl_cffi import requests as cffi_requests
 
-        resp = cffi_requests.get(url, impersonate="chrome", timeout=35)
+        resp = cffi_requests.get(url, impersonate="chrome", timeout=20)
+        if resp.status_code in (403, 404, 410):
+            raise DownloadError(f"CDN returned HTTP {resp.status_code}")
         if resp.status_code == 200 and len(resp.content) > 1000:
             if len(resp.content) > MAX_RAW_DOWNLOAD_BYTES:
                 raise DownloadError("Video exceeds maximum allowed download size.")
@@ -595,19 +571,44 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
     height: int | None = None
     duration: float | int | None = None
     thumb_url: str | None = None
-    video_url: str | None = None
+    candidate_video_urls: list[str] = []
     slide_video_urls: list[str] = []
     slide_image_urls: list[str] = []
+
+    def _add_candidate(u: str | None) -> None:
+        if u and isinstance(u, str) and u.startswith("http") and u not in candidate_video_urls:
+            candidate_video_urls.append(u)
 
     try:
         from curl_cffi import requests as cffi_requests
 
-        # 1. Try Instagram Embed Captioned page (works without login even on datacenter IPs)
+        # 1. Fast kkinstagram check (0.2s redirect to direct MP4)
+        try:
+            kk_resp = cffi_requests.get(
+                f"https://www.kkinstagram.com/reel/{shortcode}/",
+                headers={"User-Agent": "TelegramBot (like TwitterBot)"},
+                allow_redirects=False,
+                timeout=6,
+            )
+            loc = kk_resp.headers.get("location")
+            if loc and loc.startswith("http") and (".mp4" in loc or "fbcdn.net" in loc or "cdninstagram.com" in loc):
+                _add_candidate(loc)
+            elif kk_resp.status_code == 200 and kk_resp.text:
+                og_m = re.search(
+                    r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+                    kk_resp.text,
+                )
+                if og_m:
+                    _add_candidate(html.unescape(og_m.group(1)))
+        except Exception:
+            pass
+
+        # 2. Instagram Embed Captioned page (metadata, thumbnails, and carousel slides)
         try:
             emb_resp = cffi_requests.get(
                 f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
                 impersonate="chrome",
-                timeout=12,
+                timeout=7,
             )
             if emb_resp.status_code == 200 and emb_resp.text:
                 html_text = emb_resp.text
@@ -633,7 +634,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                         if isinstance(media.get("video_duration"), (int, float)):
                             duration = media["video_duration"]
                         thumb_url = media.get("display_url") or media.get("thumbnail_src")
-                        video_url = media.get("video_url")
+                        _add_candidate(media.get("video_url"))
 
                         sidecar = ((media.get("edge_sidecar_to_children") or {}).get("edges")) or []
                         for edge in sidecar:
@@ -642,50 +643,26 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                                 v_candidate = node.get("video_url")
                                 if v_candidate not in slide_video_urls:
                                     slide_video_urls.append(v_candidate)
-                                if not video_url:
-                                    video_url = v_candidate
+                                _add_candidate(v_candidate)
                             else:
                                 img_candidate = node.get("display_url")
                                 if img_candidate and img_candidate not in slide_image_urls:
                                     slide_image_urls.append(img_candidate)
 
-                if not video_url:
-                    m_vid = re.search(r'\\"video_url\\"\s*:\s*\\"((?:[^"\\]|\\.)*)\\"', html_text)
-                    if m_vid:
-                        video_url = json.loads(f'"{m_vid.group(1)}"').replace(r"\/", "/")
+                m_vid = re.search(r'\\"video_url\\"\s*:\s*\\"((?:[^"\\]|\\.)*)\\"', html_text)
+                if m_vid:
+                    _add_candidate(json.loads(f'"{m_vid.group(1)}"').replace(r"\/", "/"))
         except Exception:
             pass
 
-        # 2. Try kkinstagram redirect to direct Instagram CDN MP4
-        if not video_url:
-            try:
-                kk_resp = cffi_requests.get(
-                    f"https://www.kkinstagram.com/reel/{shortcode}/",
-                    headers={"User-Agent": "TelegramBot (like TwitterBot)"},
-                    allow_redirects=False,
-                    timeout=10,
-                )
-                loc = kk_resp.headers.get("location")
-                if loc and loc.startswith("http") and (".mp4" in loc or "fbcdn.net" in loc or "cdninstagram.com" in loc):
-                    video_url = loc
-                elif kk_resp.status_code == 200 and kk_resp.text:
-                    og_m = re.search(
-                        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
-                        kk_resp.text,
-                    )
-                    if og_m:
-                        video_url = html.unescape(og_m.group(1))
-            except Exception:
-                pass
-
-        # 3. Try vxinstagram offload MP4
-        if not video_url:
+        # 3. Try vxinstagram offload MP4 if no candidates found yet
+        if not candidate_video_urls and not slide_image_urls:
             try:
                 vx_resp = cffi_requests.get(
                     f"https://www.vxinstagram.com/reel/{shortcode}/",
                     headers={"User-Agent": "TelegramBot (like TwitterBot)"},
                     allow_redirects=True,
-                    timeout=10,
+                    timeout=7,
                 )
                 if vx_resp.status_code == 200 and vx_resp.text:
                     og_m = re.search(
@@ -693,7 +670,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                         vx_resp.text,
                     )
                     if og_m:
-                        video_url = html.unescape(og_m.group(1))
+                        _add_candidate(html.unescape(og_m.group(1)))
                     if not thumb_url:
                         img_m = re.search(
                             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
@@ -708,6 +685,19 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
 
     caption = build_caption(url, title=title, author=author)
     dur_int = int(round(duration)) if isinstance(duration, (int, float)) else None
+
+    if candidate_video_urls:
+        FAST_META_CACHE[url] = VideoData(
+            file_path=None,
+            title=title[:200],
+            author=author[:100],
+            caption=caption,
+            width=width,
+            height=height,
+            duration=dur_int,
+            direct_video_url=candidate_video_urls[0],
+            thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
+        )
 
     # Multi-video or mixed carousel post
     if len(slide_video_urls) > 1 or (slide_video_urls and slide_image_urls):
@@ -745,10 +735,10 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                 thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
             )
 
-    if video_url and video_url.startswith("http"):
+    for cand_url in candidate_video_urls:
         video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
         try:
-            _download_cffi_or_urllib(video_url, video_dest)
+            _download_cffi_or_urllib(cand_url, video_dest)
             if video_dest.exists() and video_dest.stat().st_size > 1000:
                 video_dest = _compress_video_if_needed(video_dest, dur_int, ffmpeg_path)
                 return VideoData(
@@ -759,11 +749,12 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                     width=width,
                     height=height,
                     duration=dur_int,
-                    direct_video_url=video_url,
+                    direct_video_url=cand_url,
                     thumbnail_url=thumb_url if isinstance(thumb_url, str) and thumb_url.startswith("http") else None,
                 )
         except Exception:
             video_dest.unlink(missing_ok=True)
+            continue
 
     if slide_image_urls:
         image_paths = []
@@ -948,6 +939,8 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
     unique_id = uuid.uuid4().hex[:12]
     ffmpeg_path = _resolve_ffmpeg_path()
     resolved_url = _resolve_share_redirects(url)
+    if resolved_url != url:
+        RESOLVED_URL_CACHE[url] = resolved_url
 
     if "tiktok.com" in resolved_url.lower():
         tikwm_res = _try_tikwm_fallback(resolved_url, unique_id, ffmpeg_path)
@@ -1043,11 +1036,11 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
         for leftover in DOWNLOAD_DIR.glob(f"{unique_id}.*"):
             leftover.unlink(missing_ok=True)
 
-        if is_instagram:
+        if is_instagram and COOKIES_FILE.exists():
             ig_res = _try_instagram_fallback(resolved_url, unique_id, ffmpeg_path)
             if ig_res:
                 return ig_res
-        if is_twitter:
+        if is_twitter and COOKIES_FILE.exists():
             tw_res = _try_twitter_fallback(resolved_url, unique_id, ffmpeg_path)
             if tw_res:
                 return tw_res
@@ -1065,6 +1058,8 @@ def _download_audio_sync(url: str) -> AudioData:
     unique_id = uuid.uuid4().hex[:12]
     ffmpeg_path = _resolve_ffmpeg_path()
     resolved_url = _resolve_share_redirects(url)
+    if resolved_url != url:
+        RESOLVED_URL_CACHE[url] = resolved_url
 
     if "tiktok.com" in resolved_url.lower():
         tikwm = _try_tikwm_fallback(resolved_url, unique_id, ffmpeg_path)

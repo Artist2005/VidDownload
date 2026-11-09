@@ -40,6 +40,7 @@ from downloader import (
     download_video,
     extract_all_video_urls,
     extract_video_url,
+    get_fast_meta,
     is_regular_youtube_url,
     recognize_song_from_url,
     render_slideshow_to_video,
@@ -976,15 +977,16 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
                     url,
                     bot,
                     inline_query.from_user.id,
-                    upload_timeout=4.0,
+                    upload_timeout=2.5,
                 )
             )
             cached_media, fallback_video_data = await asyncio.wait_for(
                 asyncio.shield(prep_task),
-                timeout=7.5,
+                timeout=4.2,
             )
         except asyncio.TimeoutError:
-            logger.info("Inline download exceeded 7.5s timeout for %s, falling back to placeholder card", url)
+            fallback_video_data = fallback_video_data or get_fast_meta(url)
+            logger.info("Inline download exceeded 4.2s timeout for %s, using fast meta or placeholder", url)
         except Exception as exc:
             logger.warning("Inline direct download failed for %s: %s", url, exc)
 
@@ -1011,11 +1013,17 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
             fallback_video_data.title,
             fallback_video_data.author,
         )
+        raw_thumb = fallback_video_data.thumbnail_url or ""
+        thumb = (
+            raw_thumb
+            if (".jpg" in raw_thumb.lower() or ".jpeg" in raw_thumb.lower())
+            else "https://picsum.photos/320/320.jpg"
+        )
         direct_video = InlineQueryResultVideo(
             id=f"direct_{result_id}",
             video_url=fallback_video_data.direct_video_url,
             mime_type="video/mp4",
-            thumbnail_url=fallback_video_data.thumbnail_url or fallback_video_data.direct_video_url,
+            thumbnail_url=thumb,
             title=f"Send Video from {platform}",
             description=fallback_video_data.title or url,
             caption=caption,
@@ -1053,6 +1061,7 @@ async def _replace_inline_message_with_video(
     url: str,
     user_id: int,
     bot: Bot,
+    is_placeholder: bool = True,
 ) -> None:
     platform = detect_platform_name(url)
     result_id = storage.register_url(url)
@@ -1060,14 +1069,15 @@ async def _replace_inline_message_with_video(
     try:
         cached_media, _ = await _prepare_and_cache_video_for_inline(url, bot, user_id)
         if not cached_media:
-            await bot.edit_message_text(
-                inline_message_id=inline_message_id,
-                text=(
-                    f"<b>One-time activation needed:</b> open @{_BOT_USERNAME} and press /start "
-                    f"so the bot can upload inline video files."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
+            if is_placeholder:
+                await bot.edit_message_text(
+                    inline_message_id=inline_message_id,
+                    text=(
+                        f"<b>One-time activation needed:</b> open @{_BOT_USERNAME} and press /start "
+                        f"so the bot can upload inline video files."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
             return
 
         caption = cached_media.caption or build_caption(url, cached_media.title, cached_media.author)
@@ -1083,24 +1093,26 @@ async def _replace_inline_message_with_video(
         )
     except DownloadError as exc:
         logger.warning("Download error (%s): %s", url, exc)
-        try:
-            await bot.edit_message_text(
-                inline_message_id=inline_message_id,
-                text=f"<b>Failed to download video from {platform}.</b>\nMake sure the link is public.",
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramBadRequest:
-            pass
+        if is_placeholder:
+            try:
+                await bot.edit_message_text(
+                    inline_message_id=inline_message_id,
+                    text=f"<b>Failed to download video from {platform}.</b>\nMake sure the link is public.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramBadRequest:
+                pass
     except Exception as exc:
         logger.exception("Unexpected error in inline mode: %s", exc)
-        try:
-            await bot.edit_message_text(
-                inline_message_id=inline_message_id,
-                text=f"<b>An error occurred while processing the video.</b>\n{html.escape(url)}",
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramBadRequest:
-            pass
+        if is_placeholder:
+            try:
+                await bot.edit_message_text(
+                    inline_message_id=inline_message_id,
+                    text=f"<b>An error occurred while processing the video.</b>\n{html.escape(url)}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramBadRequest:
+                pass
 
 
 @dp.chosen_inline_result()
@@ -1109,12 +1121,11 @@ async def handle_chosen_inline_result(chosen: ChosenInlineResult, bot: Bot) -> N
     if not inline_message_id:
         return
 
-    # Only replace the message if the user picked the "Loading video..." placeholder article.
-    # If the user already sent a cached_ or direct_ video, do NOT overwrite the video message.
-    if not (chosen.result_id or "").startswith("load_"):
+    res_id = chosen.result_id or ""
+    if res_id.startswith(("cached_", "hist_")):
         return
 
-    url = extract_video_url(chosen.query, allow_any_http=True) or storage.get_url(chosen.result_id)
+    url = extract_video_url(chosen.query, allow_any_http=True) or storage.get_url(res_id)
     if not url:
         return
 
@@ -1123,6 +1134,7 @@ async def handle_chosen_inline_result(chosen: ChosenInlineResult, bot: Bot) -> N
         url=url,
         user_id=chosen.from_user.id,
         bot=bot,
+        is_placeholder=not res_id.startswith("direct_"),
     )
 
 
@@ -1343,13 +1355,13 @@ async def _process_single_url_in_chat(
 
 @dp.message(F.text | F.caption)
 async def handle_message_with_link(message: Message, bot: Bot) -> None:
-    if message.via_bot:
-        return
-
     if not storage.get_storage_chat_id():
         storage.set_fallback_storage_chat_id(message.chat.id)
     elif message.chat.type == ChatType.PRIVATE:
         storage.set_fallback_storage_chat_id(message.chat.id)
+
+    if message.via_bot:
+        return
 
     text_parts: list[str] = []
     if message.text:
