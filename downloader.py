@@ -22,20 +22,23 @@ from config import (
     MAX_RAW_DOWNLOAD_BYTES,
 )
 
-URL_PATTERN = re.compile(
-    r"(https?://(?:"
-    r"(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/[^\s<>\"']+"
-    r"|(?:www\.)?instagram\.com/(?:reel|reels|p|tv|share)/[^\s<>\"']+"
-    r"|(?:www\.|m\.)?youtube\.com/(?:shorts/[^\s<>\"']+|watch\?[^\s<>\"']*v=[A-Za-z0-9_-]{11}[^\s<>\"']*)"
-    r"|youtu\.be/[A-Za-z0-9_-]{11}[^\s<>\"']*"
-    r"|(?:www\.|mobile\.)?(?:twitter\.com|x\.com)/[^\s<>\"']+/status/\d+[^\s<>\"']*"
-    r"|(?:www\.|old\.)?reddit\.com/(?:r/[^\s<>\"']+/comments/[^\s<>\"']+|s/[^\s<>\"']+)"
-    r"|v\.redd\.it/[^\s<>\"']+"
-    r"|(?:www\.)?threads\.(?:net|com)/(?:@[^\s<>\"']+/post/[^\s<>\"']+|t/[^\s<>\"']+)"
-    r"|(?:(?:www\.|[a-z]{2}\.)?pinterest\.com/pin/[^\s<>\"']+|pin\.it/[^\s<>\"']+)"
-    r"|(?:(?:www\.|m\.|web\.)?facebook\.com/(?:reel|share/r|share/v|watch)[^\s<>\"']+|fb\.watch/[^\s<>\"']+)"
-    r"|(?:clips\.twitch\.tv/[^\s<>\"']+|(?:www\.|m\.)?twitch\.tv/[^\s<>\"']+/clip/[^\s<>\"']+)"
-    r"))",
+SUPPORTED_DOMAIN_PATTERN = re.compile(
+    r"(https?://(?:[\w-]+\.)?(?:"
+    r"tiktok\.com"
+    r"|instagram\.com|instagr\.am"
+    r"|youtube\.com|youtu\.be"
+    r"|twitter\.com|x\.com|t\.co"
+    r"|reddit\.com|redd\.it"
+    r"|threads\.net|threads\.com"
+    r"|pinterest\.com|pin\.it"
+    r"|facebook\.com|fb\.watch|fb\.gg"
+    r"|twitch\.tv"
+    r")/[^\s<>\"']+)",
+    re.IGNORECASE,
+)
+
+ANY_URL_PATTERN = re.compile(
+    r"(https?://[^\s<>\"']+)",
     re.IGNORECASE,
 )
 
@@ -60,6 +63,8 @@ class VideoData:
     is_slideshow: bool = False
     image_paths: list[Path] = field(default_factory=list)
     audio_path: Path | None = None
+    direct_video_url: str | None = None
+    thumbnail_url: str | None = None
 
     def cleanup(self) -> None:
         if self.file_path and self.file_path.exists():
@@ -94,25 +99,40 @@ class DownloadError(Exception):
     pass
 
 
-def extract_video_url(text: str | None) -> str | None:
+def extract_video_url(text: str | None, allow_any_http: bool = False) -> str | None:
     if not text:
         return None
-    match = URL_PATTERN.search(text)
-    if not match:
-        return None
-    return match.group(1).rstrip(".,;!)>\"'")
+    match = SUPPORTED_DOMAIN_PATTERN.search(text)
+    if match:
+        return match.group(1).rstrip(".,;!)>\"'")
+    if allow_any_http:
+        any_match = ANY_URL_PATTERN.search(text)
+        if any_match:
+            return any_match.group(1).rstrip(".,;!)>\"'")
+    return None
 
 
-def extract_all_video_urls(text: str | None, max_urls: int = 5) -> list[str]:
+def extract_all_video_urls(
+    text: str | None,
+    max_urls: int = 5,
+    allow_any_http: bool = False,
+) -> list[str]:
     if not text:
         return []
     seen: list[str] = []
-    for match in URL_PATTERN.finditer(text):
+    for match in SUPPORTED_DOMAIN_PATTERN.finditer(text):
         clean = match.group(1).rstrip(".,;!)>\"'")
         if clean not in seen:
             seen.append(clean)
         if len(seen) >= max_urls:
-            break
+            return seen
+    if allow_any_http and not seen:
+        for match in ANY_URL_PATTERN.finditer(text):
+            clean = match.group(1).rstrip(".,;!)>\"'")
+            if clean not in seen:
+                seen.append(clean)
+            if len(seen) >= max_urls:
+                break
     return seen
 
 
@@ -127,13 +147,13 @@ def detect_platform_name(url: str) -> str:
     lower = url.lower()
     if "tiktok.com" in lower:
         return "TikTok"
-    if "instagram.com" in lower:
+    if "instagram.com" in lower or "instagr.am" in lower:
         return "Instagram"
     if "youtube.com/shorts/" in lower:
         return "YouTube Shorts"
     if "youtube.com" in lower or "youtu.be" in lower:
         return "YouTube"
-    if "twitter.com" in lower or "x.com" in lower:
+    if "twitter.com" in lower or "x.com" in lower or "t.co/" in lower:
         return "Twitter (X)"
     if "reddit.com" in lower or "redd.it" in lower:
         return "Reddit"
@@ -141,7 +161,7 @@ def detect_platform_name(url: str) -> str:
         return "Threads"
     if "pinterest.com" in lower or "pin.it" in lower:
         return "Pinterest"
-    if "facebook.com" in lower or "fb.watch" in lower:
+    if "facebook.com" in lower or "fb.watch" in lower or "fb.gg" in lower:
         return "Facebook"
     if "twitch.tv" in lower:
         return "Twitch"
@@ -275,6 +295,7 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
     author_info = data.get("author") or {}
     author = (author_info.get("nickname") or author_info.get("unique_id") or "").strip()
     duration = data.get("duration")
+    cover_url = data.get("cover") or data.get("origin_cover")
     caption = build_caption(url, title=title, author=author)
 
     images = data.get("images")
@@ -307,6 +328,7 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
                 is_slideshow=True,
                 image_paths=image_paths,
                 audio_path=audio_path,
+                thumbnail_url=cover_url,
             )
 
     play_url = data.get("play") or data.get("wmplay")
@@ -325,6 +347,8 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
                 author=author,
                 caption=caption,
                 duration=int(duration) if isinstance(duration, (int, float)) else None,
+                direct_video_url=play_url if str(play_url).startswith("http") else None,
+                thumbnail_url=cover_url if str(cover_url).startswith("http") else None,
             )
         except Exception:
             video_dest.unlink(missing_ok=True)
@@ -457,6 +481,8 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
             height = info.get("height")
             duration = info.get("duration")
             dur_int = int(round(duration)) if isinstance(duration, (int, float)) else None
+            thumb = info.get("thumbnail")
+            direct_url = info.get("url") if info.get("ext") == "mp4" else None
 
             downloaded_path = _compress_video_if_needed(downloaded_path, dur_int, ffmpeg_path)
 
@@ -468,6 +494,8 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
                 width=int(width) if isinstance(width, (int, float)) else None,
                 height=int(height) if isinstance(height, (int, float)) else None,
                 duration=dur_int,
+                direct_video_url=direct_url if isinstance(direct_url, str) and direct_url.startswith("http") else None,
+                thumbnail_url=thumb if isinstance(thumb, str) and thumb.startswith("http") else None,
             )
     except Exception as exc:
         for leftover in DOWNLOAD_DIR.glob(f"{unique_id}.*"):

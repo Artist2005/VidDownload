@@ -19,6 +19,7 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
     InlineQueryResultCachedVideo,
+    InlineQueryResultVideo,
     InlineQueryResultsButton,
     InputMediaPhoto,
     InputMediaVideo,
@@ -44,7 +45,7 @@ from downloader import (
     render_slideshow_to_video,
     update_ytdlp_package,
 )
-from storage import ChatSettings, storage
+from storage import CachedMedia, ChatSettings, storage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,13 +124,13 @@ def _settings_keyboard(cfg: ChatSettings, is_group: bool) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _loading_keyboard(platform: str = "Video") -> InlineKeyboardMarkup:
+def _loading_keyboard(result_id: str, platform: str = "Video") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"Downloading from {platform}...",
-                    callback_data="downloading",
+                    text=f"Tap to Load Video ({platform})",
+                    callback_data=f"inline_dl:{result_id}",
                 )
             ]
         ]
@@ -189,7 +190,7 @@ def _build_home_text(bot_username: str) -> str:
         f"<b>Three ways to use:</b>\n"
         f"1. <b>Direct Message.</b> Paste any video link right here.\n"
         f"2. <b>Inline Mode (@) in any chat.</b> Type in the message input:\n"
-        f"<code>@{bot_username} link</code> (or just <code>@{bot_username} </code> to pick from your recent downloads).\n"
+        f"<code>@{bot_username} link</code>, wait 2-3 seconds for the video card to appear, and tap it to send the video directly.\n"
         f"3. <b>Group Chats.</b> Add me to a group and I will automatically reply with the video file whenever someone shares a link."
     )
 
@@ -217,9 +218,8 @@ def _build_help_text(bot_username: str) -> str:
     return (
         "<b>How to Use the Bot:</b>\n\n"
         "<b>Inline Mode & History (@):</b>\n"
-        f"In any chat or channel, type <code>@{bot_username} </code>:\n"
-        "• Without a link, you will see the 10 most recent videos (type a keyword to filter them).\n"
-        "• With a new link, tap the «Download video» card and wait a few seconds for the bot to replace the message with the video.\n\n"
+        f"In any chat or channel, type <code>@{bot_username} link</code> and wait 2-3 seconds. "
+        "The bot will prepare the video right in the popup list so when you tap it, the video file is sent immediately.\n\n"
         "<b>Batch Downloading:</b>\n"
         "You can send up to 5 links in one message, and the bot will download each of them in order.\n\n"
         "<b>Updating cookies.txt (Admin):</b>\n"
@@ -245,7 +245,7 @@ def _build_settings_text(cfg: ChatSettings, is_group: bool) -> str:
 
 def _build_stats_text(chat_id: int) -> str:
     storage_chat = storage.get_storage_chat_id()
-    inline_ready = "Ready" if storage_chat else "Send /start in a private chat with the bot first"
+    inline_ready = f"Ready (Chat ID: {storage_chat})" if storage_chat else "Send /start in a private chat with the bot first"
     cookies_ready = "Active (cookies.txt loaded)" if COOKIES_FILE.exists() else "Not set (send cookies.txt to DM if needed)"
     return (
         "<b>Bot Statistics & Status:</b>\n\n"
@@ -259,6 +259,76 @@ def _build_stats_text(chat_id: int) -> str:
     )
 
 
+async def _prepare_and_cache_video_for_inline(
+    url: str,
+    bot: Bot,
+    user_id: int,
+) -> tuple[CachedMedia | None, VideoData | None]:
+    async with storage.get_lock(url):
+        cached = storage.get_cached_media(url)
+        if cached:
+            return cached, None
+
+        max_h = 720 if is_regular_youtube_url(url) else None
+        video_data = await download_video(url, max_height=max_h)
+        rendered_slideshow = None
+
+        try:
+            upload_path = video_data.file_path
+            if video_data.is_slideshow and not upload_path:
+                rendered_path = await render_slideshow_to_video(video_data)
+                upload_path = rendered_path
+                rendered_slideshow = rendered_path
+
+            if not upload_path or not upload_path.exists():
+                return None, video_data
+
+            candidate_chats: list[int] = []
+            saved_chat = storage.get_storage_chat_id()
+            if saved_chat:
+                candidate_chats.append(saved_chat)
+            if user_id and user_id not in candidate_chats:
+                candidate_chats.append(user_id)
+
+            for target_chat in candidate_chats:
+                try:
+                    temp_msg = await bot.send_video(
+                        chat_id=target_chat,
+                        video=FSInputFile(upload_path),
+                        width=video_data.width,
+                        height=video_data.height,
+                        duration=video_data.duration,
+                        supports_streaming=True,
+                        disable_notification=True,
+                    )
+                    if temp_msg.video:
+                        file_id = temp_msg.video.file_id
+                        caption = video_data.caption or build_caption(url, video_data.title, video_data.author)
+                        storage.save_media(
+                            url,
+                            file_id,
+                            caption=caption,
+                            title=video_data.title,
+                            author=video_data.author,
+                        )
+                        if not saved_chat:
+                            storage.set_fallback_storage_chat_id(target_chat)
+                        try:
+                            await temp_msg.delete()
+                        except TelegramBadRequest:
+                            pass
+                        return storage.get_cached_media(url), None
+                except TelegramBadRequest as exc:
+                    logger.warning("Could not upload temp inline video to chat %s: %s", target_chat, exc)
+                    continue
+
+            return None, video_data
+        finally:
+            video_data.cleanup()
+            if rendered_slideshow and hasattr(rendered_slideshow, "unlink"):
+                rendered_slideshow.unlink(missing_ok=True)
+
+
 @dp.my_chat_member()
 async def handle_bot_added_to_group(event: ChatMemberUpdated, bot: Bot) -> None:
     if event.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -270,6 +340,8 @@ async def handle_bot_added_to_group(event: ChatMemberUpdated, bot: Bot) -> None:
         ChatMemberStatus.KICKED,
         ChatMemberStatus.RESTRICTED,
     ):
+        if not storage.get_storage_chat_id():
+            storage.set_fallback_storage_chat_id(event.chat.id)
         cfg = storage.get_chat_settings(event.chat.id)
         await bot.send_message(
             chat_id=event.chat.id,
@@ -298,6 +370,8 @@ async def handle_start(message: Message, bot: Bot) -> None:
 
 @dp.message(Command("help"))
 async def handle_help_command(message: Message) -> None:
+    if message.chat.type == ChatType.PRIVATE:
+        storage.set_fallback_storage_chat_id(message.chat.id)
     await message.answer(
         _build_help_text(_BOT_USERNAME),
         parse_mode=ParseMode.HTML,
@@ -484,6 +558,27 @@ async def handle_inline_update_ytdlp(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "downloading")
 async def handle_downloading_callback(callback: CallbackQuery) -> None:
     await callback.answer("Video is currently downloading, please wait a few seconds.", show_alert=False)
+
+
+@dp.callback_query(F.data.startswith("inline_dl:"))
+async def handle_inline_download_button(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.inline_message_id:
+        await callback.answer()
+        return
+
+    result_id = (callback.data or "").split(":", 1)[1]
+    url = storage.get_url(result_id)
+    if not url:
+        await callback.answer("Link expired, please resend.", show_alert=True)
+        return
+
+    await callback.answer("Loading video into chat...")
+    await _replace_inline_message_with_video(
+        inline_message_id=callback.inline_message_id,
+        url=url,
+        user_id=callback.from_user.id,
+        bot=bot,
+    )
 
 
 @dp.callback_query(F.data == "mp3_already_sent")
@@ -773,9 +868,9 @@ async def handle_youtube_quality_callback(callback: CallbackQuery, bot: Bot) -> 
 
 
 @dp.inline_query()
-async def handle_inline_query(inline_query: InlineQuery) -> None:
+async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
     query_text = inline_query.query.strip()
-    url = extract_video_url(query_text)
+    url = extract_video_url(query_text, allow_any_http=True)
 
     if not url:
         recent_items = storage.get_recent_media(query=query_text, limit=10)
@@ -833,12 +928,41 @@ async def handle_inline_query(inline_query: InlineQuery) -> None:
     result_id = storage.register_url(url)
     cached_media = storage.get_cached_media(url)
 
+    if not cached_media:
+        try:
+            cached_media, fallback_video_data = await asyncio.wait_for(
+                _prepare_and_cache_video_for_inline(url, bot, inline_query.from_user.id),
+                timeout=8.0,
+            )
+            if not cached_media and fallback_video_data and fallback_video_data.direct_video_url:
+                caption = fallback_video_data.caption or build_caption(
+                    url, fallback_video_data.title, fallback_video_data.author
+                )
+                thumb = fallback_video_data.thumbnail_url or "https://www.tikwm.com/favicon.ico"
+                direct_result = InlineQueryResultVideo(
+                    id=result_id,
+                    video_url=fallback_video_data.direct_video_url,
+                    mime_type="video/mp4",
+                    thumbnail_url=thumb,
+                    title=f"Send Video from {platform}",
+                    description=fallback_video_data.title or url,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_video_keyboard(result_id, url),
+                )
+                await inline_query.answer([direct_result], cache_time=60, is_personal=False)
+                return
+        except asyncio.TimeoutError:
+            logger.info("Inline download exceeded 8s timeout for %s, falling back to placeholder card", url)
+        except Exception as exc:
+            logger.warning("Inline direct download failed for %s: %s", url, exc)
+
     if cached_media:
         caption = cached_media.caption or build_caption(url, cached_media.title, cached_media.author)
         cached_video = InlineQueryResultCachedVideo(
             id=result_id,
             video_file_id=cached_media.file_id,
-            title=f"Send ready video from {platform}",
+            title=f"Send Video from {platform}",
             description=cached_media.title or url,
             caption=caption,
             parse_mode=ParseMode.HTML,
@@ -849,16 +973,70 @@ async def handle_inline_query(inline_query: InlineQuery) -> None:
 
     download_article = InlineQueryResultArticle(
         id=result_id,
-        title=f"Download video from {platform}",
-        description=f"Tap here to download and send to chat ({url[:60]})",
+        title=f"Send Video from {platform}",
+        description=f"Tap here to send the video to chat ({url[:60]})",
         input_message_content=InputTextMessageContent(
-            message_text=f"<b>Downloading video from {platform}...</b>\n<code>{html.escape(url[:80])}</code>",
+            message_text=f"<b>Loading video from {platform}...</b>",
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         ),
-        reply_markup=_loading_keyboard(platform),
+        reply_markup=_loading_keyboard(result_id, platform),
     )
-    await inline_query.answer([download_article], cache_time=5, is_personal=False)
+    await inline_query.answer([download_article], cache_time=1, is_personal=False)
+
+
+async def _replace_inline_message_with_video(
+    inline_message_id: str,
+    url: str,
+    user_id: int,
+    bot: Bot,
+) -> None:
+    platform = detect_platform_name(url)
+    result_id = storage.register_url(url)
+
+    try:
+        cached_media, _ = await _prepare_and_cache_video_for_inline(url, bot, user_id)
+        if not cached_media:
+            await bot.edit_message_text(
+                inline_message_id=inline_message_id,
+                text=(
+                    f"<b>One-time activation needed:</b> open @{_BOT_USERNAME} and press /start "
+                    f"so the bot can upload inline video files."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        caption = cached_media.caption or build_caption(url, cached_media.title, cached_media.author)
+        await bot.edit_message_media(
+            inline_message_id=inline_message_id,
+            media=InputMediaVideo(
+                media=cached_media.file_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+            ),
+            reply_markup=_video_keyboard(result_id, url),
+        )
+    except DownloadError as exc:
+        logger.warning("Download error (%s): %s", url, exc)
+        try:
+            await bot.edit_message_text(
+                inline_message_id=inline_message_id,
+                text=f"<b>Failed to download video from {platform}.</b>\nMake sure the link is public.",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramBadRequest:
+            pass
+    except Exception as exc:
+        logger.exception("Unexpected error in inline mode: %s", exc)
+        try:
+            await bot.edit_message_text(
+                inline_message_id=inline_message_id,
+                text=f"<b>An error occurred while processing the video.</b>\n{html.escape(url)}",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramBadRequest:
+            pass
 
 
 @dp.chosen_inline_result()
@@ -867,136 +1045,16 @@ async def handle_chosen_inline_result(chosen: ChosenInlineResult, bot: Bot) -> N
     if not inline_message_id:
         return
 
-    url = extract_video_url(chosen.query) or storage.get_url(chosen.result_id)
+    url = extract_video_url(chosen.query, allow_any_http=True) or storage.get_url(chosen.result_id)
     if not url:
-        await bot.edit_message_text(
-            inline_message_id=inline_message_id,
-            text="Could not recognize the video link.",
-        )
         return
 
-    platform = detect_platform_name(url)
-    result_id = storage.register_url(url)
-
-    async with storage.get_lock(url):
-        cached_media = storage.get_cached_media(url)
-        if cached_media:
-            try:
-                await bot.edit_message_media(
-                    inline_message_id=inline_message_id,
-                    media=InputMediaVideo(
-                        media=cached_media.file_id,
-                        caption=cached_media.caption or build_caption(url),
-                        parse_mode=ParseMode.HTML,
-                    ),
-                    reply_markup=_video_keyboard(result_id, url),
-                )
-                return
-            except TelegramBadRequest:
-                pass
-
-        target_storage_chat = storage.get_storage_chat_id() or chosen.from_user.id
-        video_data: VideoData | None = None
-        rendered_slideshow = None
-
-        try:
-            max_h = 720 if is_regular_youtube_url(url) else None
-            video_data = await download_video(url, max_height=max_h)
-
-            upload_path = video_data.file_path
-            if video_data.is_slideshow and not upload_path:
-                rendered_path = await render_slideshow_to_video(video_data)
-                upload_path = rendered_path
-                rendered_slideshow = rendered_path
-
-            if not upload_path or not upload_path.exists():
-                raise DownloadError("Could not prepare video file.")
-
-            try:
-                await bot.edit_message_text(
-                    inline_message_id=inline_message_id,
-                    text=f"<b>Sending video from {platform} to chat...</b>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_loading_keyboard(platform),
-                )
-            except TelegramBadRequest:
-                pass
-
-            try:
-                temp_msg = await bot.send_video(
-                    chat_id=target_storage_chat,
-                    video=FSInputFile(upload_path),
-                    width=video_data.width,
-                    height=video_data.height,
-                    duration=video_data.duration,
-                    supports_streaming=True,
-                    disable_notification=True,
-                )
-            except TelegramBadRequest as exc:
-                logger.error("Failed to upload video to technical chat (%s): %s", target_storage_chat, exc)
-                await bot.edit_message_text(
-                    inline_message_id=inline_message_id,
-                    text=(
-                        f"<b>One-time activation required:</b> open a private chat with @{_BOT_USERNAME} "
-                        f"and press /start so the bot can send videos in inline mode."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-
-            if not temp_msg.video:
-                raise DownloadError("Telegram did not return a file_id for the video.")
-
-            file_id = temp_msg.video.file_id
-            caption = video_data.caption or build_caption(url, video_data.title, video_data.author)
-            storage.save_media(
-                url,
-                file_id,
-                caption=caption,
-                title=video_data.title,
-                author=video_data.author,
-            )
-
-            await bot.edit_message_media(
-                inline_message_id=inline_message_id,
-                media=InputMediaVideo(
-                    media=file_id,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                ),
-                reply_markup=_video_keyboard(result_id, url),
-            )
-
-            try:
-                await temp_msg.delete()
-            except TelegramBadRequest:
-                pass
-
-        except DownloadError as exc:
-            logger.warning("Download error (%s): %s", url, exc)
-            try:
-                await bot.edit_message_text(
-                    inline_message_id=inline_message_id,
-                    text=f"<b>Failed to download video from {platform}.</b>\nMake sure the link is public.",
-                    parse_mode=ParseMode.HTML,
-                )
-            except TelegramBadRequest:
-                pass
-        except Exception as exc:
-            logger.exception("Unexpected error in inline mode: %s", exc)
-            try:
-                await bot.edit_message_text(
-                    inline_message_id=inline_message_id,
-                    text=f"<b>An error occurred while processing the video.</b>\n{html.escape(url)}",
-                    parse_mode=ParseMode.HTML,
-                )
-            except TelegramBadRequest:
-                pass
-        finally:
-            if video_data:
-                video_data.cleanup()
-            if rendered_slideshow and hasattr(rendered_slideshow, "unlink"):
-                rendered_slideshow.unlink(missing_ok=True)
+    await _replace_inline_message_with_video(
+        inline_message_id=inline_message_id,
+        url=url,
+        user_id=chosen.from_user.id,
+        bot=bot,
+    )
 
 
 async def _process_single_url_in_chat(
@@ -1181,8 +1239,17 @@ async def handle_message_with_link(message: Message, bot: Bot) -> None:
     if message.via_bot:
         return
 
+    if not storage.get_storage_chat_id():
+        storage.set_fallback_storage_chat_id(message.chat.id)
+    elif message.chat.type == ChatType.PRIVATE:
+        storage.set_fallback_storage_chat_id(message.chat.id)
+
     text = message.text or message.caption or ""
-    urls = extract_all_video_urls(text, max_urls=5)
+    is_private_or_mentioned = (
+        message.chat.type == ChatType.PRIVATE
+        or f"@{_BOT_USERNAME.lower()}" in text.lower()
+    )
+    urls = extract_all_video_urls(text, max_urls=5, allow_any_http=is_private_or_mentioned)
 
     if not urls:
         if message.chat.type == ChatType.PRIVATE and not text.startswith("/"):
@@ -1191,9 +1258,6 @@ async def handle_message_with_link(message: Message, bot: Bot) -> None:
                 reply_markup=_main_menu_keyboard(_BOT_USERNAME),
             )
         return
-
-    if message.chat.type == ChatType.PRIVATE:
-        storage.set_fallback_storage_chat_id(message.chat.id)
 
     total = len(urls)
     for idx, url in enumerate(urls, start=1):
