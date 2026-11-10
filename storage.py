@@ -78,7 +78,7 @@ class BotStorage:
         self._locks: dict[str, asyncio.Lock] = {}
         self._load()
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     def _load(self) -> None:
         if not self.cache_path.exists():
@@ -100,7 +100,7 @@ class BotStorage:
                         video_note_file_id=val.get("video_note_file_id"),
                     )
             self.audio_only_cache = data.get("audio_only_cache", {})
-            self.video_note_cache = data.get("video_note_cache", {})
+            self.video_note_cache = data.get("video_note_cache", {}) if schema_ver == self.SCHEMA_VERSION else {}
             self.song_cache = data.get("song_cache", {})
             self.url_by_id = data.get("url_by_id", {})
 

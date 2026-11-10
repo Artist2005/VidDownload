@@ -204,32 +204,38 @@ def _resolve_share_redirects(url: str) -> str:
     try:
         from curl_cffi import requests as cffi_requests
 
-        # 1. Follow up to 4 hops with crawler User-Agent (resolves Instagram /share/ directly without login bounce)
+        # 1. Try crawler User-Agents (resolves Instagram /share/ and short links directly without login bounce)
         curr = url
-        for _ in range(4):
-            resp_bot = cffi_requests.get(
-                curr,
-                headers={"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"},
-                allow_redirects=False,
-                timeout=5,
-            )
-            loc_bot = _extract_clean_redirect_url(resp_bot.headers.get("location"))
-            if loc_bot and loc_bot != curr:
-                if "/share/" not in loc_bot and not REDIRECT_NEEDED_PATTERN.search(loc_bot):
-                    return loc_bot
-                curr = loc_bot
-                continue
-            if resp_bot.status_code == 200 and resp_bot.text:
-                m_canon = re.search(
-                    r'(?:property=["\']og:url["\']\s+content|rel=["\']canonical["\']\s+href)=["\'](https?://[^"\']+)["\']',
-                    resp_bot.text,
-                    re.IGNORECASE,
+        crawler_uas = (
+            "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+            "WhatsApp/2.24.16.78 A",
+            "TelegramBot (like TwitterBot)",
+        )
+        for ua in crawler_uas:
+            for _ in range(3):
+                resp_bot = cffi_requests.get(
+                    curr,
+                    headers={"User-Agent": ua},
+                    allow_redirects=False,
+                    timeout=5,
                 )
-                if m_canon:
-                    canon_url = _extract_clean_redirect_url(html.unescape(m_canon.group(1)))
-                    if canon_url and "/share/" not in canon_url:
-                        return canon_url
-            break
+                loc_bot = _extract_clean_redirect_url(resp_bot.headers.get("location"))
+                if loc_bot and loc_bot.split("?")[0].rstrip("/") != curr.split("?")[0].rstrip("/"):
+                    if "/share/" not in loc_bot and not REDIRECT_NEEDED_PATTERN.search(loc_bot):
+                        return loc_bot
+                    curr = loc_bot
+                    continue
+                if resp_bot.status_code == 200 and resp_bot.text:
+                    m_canon = re.search(
+                        r'(?:property=["\']og:url["\']\s+content|rel=["\']canonical["\']\s+href)=["\'](https?://[^"\']+)["\']',
+                        resp_bot.text,
+                        re.IGNORECASE,
+                    )
+                    if m_canon:
+                        canon_url = _extract_clean_redirect_url(html.unescape(m_canon.group(1)))
+                        if canon_url and "/share/" not in canon_url:
+                            return canon_url
+                break
 
         # 2. Follow up to 3 redirect hops with Chrome impersonation
         for _ in range(3):
@@ -240,7 +246,7 @@ def _resolve_share_redirects(url: str) -> str:
                 timeout=5,
             )
             loc_hop = _extract_clean_redirect_url(resp_hop.headers.get("location"))
-            if not loc_hop or loc_hop == curr:
+            if not loc_hop or loc_hop.split("?")[0].rstrip("/") == curr.split("?")[0].rstrip("/"):
                 break
             if "/share/" not in loc_hop and not REDIRECT_NEEDED_PATTERN.search(loc_hop):
                 return loc_hop
@@ -254,7 +260,7 @@ def _resolve_share_redirects(url: str) -> str:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=6) as resp:
             final_url = _extract_clean_redirect_url(resp.geturl())
-            if final_url:
+            if final_url and "/share/" not in final_url:
                 return final_url
     except Exception:
         pass
@@ -380,7 +386,7 @@ def _probe_video_stream_info(
         if vcodec in ("mjpeg", "png", "webp", "gif", "bmp", "tiff", "jpeg2000", "apng"):
             return "", "", None, None, None
         rest = m_vid.group(2)
-        pix_fmt = "yuv420p" if (("yuv420p" in rest or "yuvj420p" in rest) and "yuv420p10" not in rest) else "other"
+        pix_fmt = "yuv420p" if ("yuv420p" in rest and "yuvj420p" not in rest and "yuv420p10" not in rest) else "other"
 
         width: int | None = None
         height: int | None = None
@@ -463,9 +469,9 @@ def _compress_video_if_needed(
 
     compressed_path = file_path.with_name(f"{file_path.stem}_compressed.mp4")
     scale_filter = (
-        "scale='min(720,iw)':-2,format=yuv420p"
+        "scale='min(720,iw)':-2,setsar=1:1,format=yuv420p"
         if needs_size_compression
-        else "scale='trunc(min(1080,iw)/2)*2':'trunc(min(1920,ih)/2)*2',format=yuv420p"
+        else "scale='trunc(min(1080,iw)/2)*2':'trunc(min(1920,ih)/2)*2',setsar=1:1,format=yuv420p"
     )
     cmd = [
         ffmpeg_path,
@@ -481,9 +487,9 @@ def _compress_video_if_needed(
         "-c:v",
         "libx264",
         "-profile:v",
-        "high",
+        "main",
         "-level",
-        "4.1",
+        "4.0",
         "-pix_fmt",
         "yuv420p",
         "-color_range",
@@ -654,6 +660,20 @@ def _download_cffi_or_urllib(url: str, dest: Path) -> None:
     _download_file(url, dest)
 
 
+_IG_B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def _instagram_shortcode_to_pk(shortcode: str) -> str | None:
+    clean = shortcode[:28] if len(shortcode) > 28 else shortcode
+    pk = 0
+    for ch in clean:
+        idx = _IG_B64_ALPHABET.find(ch)
+        if idx < 0:
+            return None
+        pk = pk * 64 + idx
+    return str(pk) if pk > 0 else None
+
+
 def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> VideoData | None:
     match = INSTAGRAM_SHORTCODE_PATTERN.search(url)
     if not match:
@@ -709,58 +729,140 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
     try:
         from curl_cffi import requests as cffi_requests
 
-        # 1. Instagram Embed Captioned page (fast local CDN edge + metadata, thumbnails, and carousel slides)
-        try:
-            emb_resp = cffi_requests.get(
-                f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
-                impersonate="chrome",
-                timeout=5,
-            )
-            if emb_resp.status_code == 200 and emb_resp.text:
-                html_text = emb_resp.text
-                ctx_match = re.search(r'"contextJSON"\s*:\s*"((?:[^"\\]|\\.)*)"', html_text)
-                if ctx_match:
-                    raw_ctx = json.loads(f'"{ctx_match.group(1)}"')
-                    ctx_data = json.loads(raw_ctx)
-                    gql = ctx_data.get("gql_data") or {}
-                    media = gql.get("shortcode_media") or gql.get("xdt_shortcode_media") or {}
-                    if media:
-                        owner = media.get("owner") or {}
-                        author = (owner.get("username") or owner.get("full_name") or "").strip()
-                        cap_edges = ((media.get("edge_media_to_caption") or {}).get("edges")) or []
-                        if cap_edges and isinstance(cap_edges[0], dict):
-                            node_txt = ((cap_edges[0].get("node") or {}).get("text") or "").strip()
-                            if node_txt:
-                                title = node_txt
-                        dims = media.get("dimensions") or {}
-                        if isinstance(dims.get("width"), (int, float)):
-                            width = int(dims["width"])
-                        if isinstance(dims.get("height"), (int, float)):
-                            height = int(dims["height"])
-                        if isinstance(media.get("video_duration"), (int, float)):
-                            duration = media["video_duration"]
-                        thumb_url = media.get("display_url") or media.get("thumbnail_src")
-                        _add_candidate(media.get("video_url"))
+        # 1. Instagram PolarisLoggedOutDesktopWWWPostRootContentQuery GraphQL API (fastest, works on 2025/2026 Reels & carousels)
+        media_pk = _instagram_shortcode_to_pk(shortcode)
+        if media_pk:
+            try:
+                gql_resp = cffi_requests.post(
+                    "https://www.instagram.com/api/graphql",
+                    headers={
+                        "X-IG-App-ID": "936619743392459",
+                        "X-ASBD-ID": "359341",
+                        "X-IG-WWW-Claim": "0",
+                        "X-FB-Friendly-Name": "PolarisLoggedOutDesktopWWWPostRootContentQuery",
+                        "X-FB-LSD": "AVp2L3_test",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Origin": "https://www.instagram.com",
+                        "Referer": f"https://www.instagram.com/reel/{shortcode}/",
+                    },
+                    data={
+                        "lsd": "AVp2L3_test",
+                        "fb_api_caller_class": "RelayModern",
+                        "fb_api_req_friendly_name": "PolarisLoggedOutDesktopWWWPostRootContentQuery",
+                        "server_timestamps": "true",
+                        "variables": json.dumps({"media_id": media_pk}, separators=(",", ":")),
+                        "doc_id": "27130156389949648",
+                    },
+                    impersonate="chrome",
+                    timeout=5,
+                )
+                if gql_resp.status_code == 200:
+                    gql_json = gql_resp.json()
+                    p_media = (
+                        ((gql_json.get("data") or {}).get("xig_polaris_media") or {}).get("if_not_gated_logged_out")
+                        or {}
+                    )
+                    if p_media:
+                        p_user = p_media.get("user") or p_media.get("owner") or {}
+                        author = (p_user.get("username") or p_user.get("full_name") or "").strip()
+                        p_cap = p_media.get("caption")
+                        if isinstance(p_cap, dict) and p_cap.get("text"):
+                            title = str(p_cap["text"]).strip()
+                        if isinstance(p_media.get("original_width"), (int, float)):
+                            width = int(p_media["original_width"])
+                        if isinstance(p_media.get("original_height"), (int, float)):
+                            height = int(p_media["original_height"])
+                        if isinstance(p_media.get("video_duration"), (int, float)):
+                            duration = p_media["video_duration"]
+                        thumb_url = p_media.get("display_uri") or p_media.get("display_url")
 
-                        sidecar = ((media.get("edge_sidecar_to_children") or {}).get("edges")) or []
-                        for edge in sidecar:
-                            node = (edge or {}).get("node") or {}
-                            if node.get("is_video") and node.get("video_url"):
-                                v_candidate = node.get("video_url")
-                                if _is_valid_video_url(v_candidate) and v_candidate not in slide_video_urls:
-                                    slide_video_urls.append(v_candidate)
-                                _add_candidate(v_candidate)
+                        for v_ver in p_media.get("video_versions") or []:
+                            if isinstance(v_ver, dict):
+                                _add_candidate(v_ver.get("url"))
+
+                        for c_item in p_media.get("carousel_media") or []:
+                            if not isinstance(c_item, dict):
+                                continue
+                            c_vids = c_item.get("video_versions") or []
+                            if c_vids and isinstance(c_vids[0], dict) and _is_valid_video_url(c_vids[0].get("url")):
+                                v_u = c_vids[0]["url"]
+                                if v_u not in slide_video_urls:
+                                    slide_video_urls.append(v_u)
+                                _add_candidate(v_u)
                             else:
-                                img_candidate = node.get("display_url")
-                                if img_candidate and img_candidate not in slide_image_urls:
-                                    slide_image_urls.append(img_candidate)
+                                c_imgs = ((c_item.get("image_versions2") or {}).get("candidates")) or []
+                                img_u = (
+                                    c_imgs[0].get("url")
+                                    if (c_imgs and isinstance(c_imgs[0], dict))
+                                    else c_item.get("display_uri")
+                                )
+                                if img_u and img_u not in slide_image_urls:
+                                    slide_image_urls.append(img_u)
+            except Exception:
+                pass
 
-                if not candidate_video_urls:
-                    m_vid = re.search(r'\\"video_url\\"\s*:\s*\\"((?:[^"\\]|\\.)*)\\"', html_text)
-                    if m_vid:
-                        _add_candidate(json.loads(f'"{m_vid.group(1)}"').replace(r"\/", "/"))
-        except Exception:
-            pass
+        if candidate_video_urls and len(slide_video_urls) <= 1 and not (slide_video_urls and slide_image_urls):
+            for cand in list(candidate_video_urls):
+                res = _try_download_candidate(cand)
+                if res:
+                    return res
+            candidate_video_urls.clear()
+
+        # 2. Instagram Embed Captioned page (fallback for older posts and carousels)
+        if not slide_image_urls and len(slide_video_urls) <= 1:
+            try:
+                emb_resp = cffi_requests.get(
+                    f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
+                    impersonate="chrome",
+                    timeout=5,
+                )
+                if emb_resp.status_code == 200 and emb_resp.text:
+                    html_text = emb_resp.text
+                    ctx_match = re.search(r'"contextJSON"\s*:\s*"((?:[^"\\]|\\.)*)"', html_text)
+                    if ctx_match:
+                        raw_ctx = json.loads(f'"{ctx_match.group(1)}"')
+                        ctx_data = json.loads(raw_ctx)
+                        gql = ctx_data.get("gql_data") or {}
+                        media = gql.get("shortcode_media") or gql.get("xdt_shortcode_media") or {}
+                        if media:
+                            owner = media.get("owner") or {}
+                            if not author:
+                                author = (owner.get("username") or owner.get("full_name") or "").strip()
+                            cap_edges = ((media.get("edge_media_to_caption") or {}).get("edges")) or []
+                            if cap_edges and isinstance(cap_edges[0], dict):
+                                node_txt = ((cap_edges[0].get("node") or {}).get("text") or "").strip()
+                                if node_txt and title == "Video":
+                                    title = node_txt
+                            dims = media.get("dimensions") or {}
+                            if not width and isinstance(dims.get("width"), (int, float)):
+                                width = int(dims["width"])
+                            if not height and isinstance(dims.get("height"), (int, float)):
+                                height = int(dims["height"])
+                            if not duration and isinstance(media.get("video_duration"), (int, float)):
+                                duration = media["video_duration"]
+                            if not thumb_url:
+                                thumb_url = media.get("display_url") or media.get("thumbnail_src")
+                            _add_candidate(media.get("video_url"))
+
+                            sidecar = ((media.get("edge_sidecar_to_children") or {}).get("edges")) or []
+                            for edge in sidecar:
+                                node = (edge or {}).get("node") or {}
+                                if node.get("is_video") and node.get("video_url"):
+                                    v_candidate = node.get("video_url")
+                                    if _is_valid_video_url(v_candidate) and v_candidate not in slide_video_urls:
+                                        slide_video_urls.append(v_candidate)
+                                    _add_candidate(v_candidate)
+                                else:
+                                    img_candidate = node.get("display_url")
+                                    if img_candidate and img_candidate not in slide_image_urls:
+                                        slide_image_urls.append(img_candidate)
+
+                    if not candidate_video_urls:
+                        m_vid = re.search(r'\\"video_url\\"\s*:\s*\\"((?:[^"\\]|\\.)*)\\"', html_text)
+                        if m_vid:
+                            _add_candidate(json.loads(f'"{m_vid.group(1)}"').replace(r"\/", "/"))
+            except Exception:
+                pass
 
         # If single video candidate found from Embed page, try downloading it right away
         if candidate_video_urls and len(slide_video_urls) <= 1 and not (slide_video_urls and slide_image_urls):
@@ -770,7 +872,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                     return res
             candidate_video_urls.clear()
 
-        # 2. Direct vxinstagram offload MP4 (fast 1-request redirect to real MP4 stream for 2025/2026 Reels)
+        # 3. Direct vxinstagram offload MP4 (fast 1-request redirect to real MP4 stream for 2025/2026 Reels)
         if not slide_image_urls and len(slide_video_urls) <= 1:
             res = _try_download_candidate(f"https://www.vxinstagram.com/offload/{shortcode}/0.mp4")
             if res:
@@ -1077,7 +1179,10 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
 
     ydl_opts: dict = {
         "outtmpl": output_template,
-        "format": f"bestvideo{height_filter}+bestaudio/best{height_filter}/best",
+        "format": (
+            f"bestvideo{height_filter}[filesize<150M]+bestaudio[filesize<30M]/"
+            f"bestvideo{height_filter}+bestaudio/best{height_filter}/best"
+        ),
         "format_sort": ["vcodec:h264", "acodec:m4a", "ext:mp4:m4a", f"res:{target_res}"],
         "merge_output_format": "mp4",
         "max_filesize": MAX_RAW_DOWNLOAD_BYTES,

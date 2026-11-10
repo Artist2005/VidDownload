@@ -332,7 +332,7 @@ async def _prepare_and_cache_video_for_inline(
                             title=video_data.title,
                             author=video_data.author,
                         )
-                        if not saved_chat:
+                        if not saved_chat or target_chat != saved_chat:
                             storage.set_fallback_storage_chat_id(target_chat)
                         asyncio.create_task(_delete_msg_quietly(temp_msg))
                         return storage.get_cached_media(url), video_data
@@ -904,7 +904,7 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
                 caption = media.caption or build_caption(cached_url, media.title, media.author)
                 results.append(
                     InlineQueryResultCachedVideo(
-                        id=f"hist_{idx}_{res_id[:12]}",
+                        id=f"hist_v{storage.SCHEMA_VERSION}_{idx}_{res_id[:12]}",
                         video_file_id=media.file_id,
                         title=f"[{platform}] {title_label[:60]}",
                         description=media.author or cached_url,
@@ -970,7 +970,7 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
     if cached_media:
         caption = cached_media.caption or build_caption(url, cached_media.title, cached_media.author)
         cached_video = InlineQueryResultCachedVideo(
-            id=f"cached_{result_id}",
+            id=f"cached_v{storage.SCHEMA_VERSION}_{result_id}",
             video_file_id=cached_media.file_id,
             title=f"Send Video from {platform}",
             description=cached_media.title or url,
@@ -1070,7 +1070,8 @@ async def handle_chosen_inline_result(chosen: ChosenInlineResult, bot: Bot) -> N
     if res_id.startswith(("cached_", "hist_")):
         return
 
-    url = extract_video_url(chosen.query, allow_any_http=True) or storage.get_url(res_id)
+    clean_res_id = res_id.removeprefix("load_").removeprefix("direct_")
+    url = extract_video_url(chosen.query, allow_any_http=True) or storage.get_url(clean_res_id) or storage.get_url(res_id)
     if not url:
         return
 
