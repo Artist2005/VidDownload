@@ -78,7 +78,7 @@ class BotStorage:
         self._locks: dict[str, asyncio.Lock] = {}
         self._load()
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def _load(self) -> None:
         if not self.cache_path.exists():

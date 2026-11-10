@@ -363,6 +363,9 @@ def _probe_video_stream_info(
             timeout=15,
         )
         info_txt = proc.stderr or ""
+        if re.search(r"Input #\d+,\s*(?:image2|jpeg_pipe|png_pipe|webp_pipe|gif|bmp_pipe)", info_txt, re.IGNORECASE):
+            return "", "", None, None, None
+
         dur_int: int | None = None
         m_dur = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", info_txt)
         if m_dur:
@@ -374,8 +377,10 @@ def _probe_video_stream_info(
             return "", "", None, None, dur_int
 
         vcodec = m_vid.group(1).lower()
+        if vcodec in ("mjpeg", "png", "webp", "gif", "bmp", "tiff", "jpeg2000", "apng"):
+            return "", "", None, None, None
         rest = m_vid.group(2)
-        pix_fmt = "yuv420p" if ("yuv420p" in rest and "yuv420p10" not in rest and "yuvj420p" not in rest) else "other"
+        pix_fmt = "yuv420p" if (("yuv420p" in rest or "yuvj420p" in rest) and "yuv420p10" not in rest) else "other"
 
         width: int | None = None
         height: int | None = None
@@ -481,10 +486,12 @@ def _compress_video_if_needed(
         "4.1",
         "-pix_fmt",
         "yuv420p",
+        "-color_range",
+        "tv",
         "-tag:v",
         "avc1",
         "-preset",
-        "ultrafast",
+        "superfast",
     ]
     if needs_size_compression:
         cmd += [
@@ -663,17 +670,25 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
     slide_video_urls: list[str] = []
     slide_image_urls: list[str] = []
 
+    def _is_valid_video_url(u: str | None) -> bool:
+        if not u or not isinstance(u, str) or not u.startswith("http"):
+            return False
+        low = u.lower()
+        if any(img_marker in low for img_marker in (".jpg", ".jpeg", ".png", ".webp", "stp=dst-jpg", "/t51.")):
+            return False
+        return ".mp4" in low or "/o1/v/t2/" in low or "/v/t50." in low
+
     def _add_candidate(u: str | None) -> None:
-        if u and isinstance(u, str) and u.startswith("http") and u not in candidate_video_urls:
-            candidate_video_urls.append(u)
+        if _is_valid_video_url(u) and u not in candidate_video_urls:
+            candidate_video_urls.append(u)  # type: ignore[arg-type]
 
     def _try_download_candidate(cand_url: str | None) -> VideoData | None:
-        if not cand_url or not isinstance(cand_url, str) or not cand_url.startswith("http"):
+        if not _is_valid_video_url(cand_url):
             return None
         dur_int = int(round(duration)) if isinstance(duration, (int, float)) else None
         video_dest = DOWNLOAD_DIR / f"{unique_id}.mp4"
         try:
-            _download_cffi_or_urllib(cand_url, video_dest)
+            _download_cffi_or_urllib(cand_url, video_dest)  # type: ignore[arg-type]
             if video_dest.exists() and video_dest.stat().st_size > 1000:
                 video_dest = _compress_video_if_needed(video_dest, dur_int, ffmpeg_path)
                 return VideoData(
@@ -699,7 +714,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
             emb_resp = cffi_requests.get(
                 f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
                 impersonate="chrome",
-                timeout=6,
+                timeout=5,
             )
             if emb_resp.status_code == 200 and emb_resp.text:
                 html_text = emb_resp.text
@@ -732,7 +747,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                             node = (edge or {}).get("node") or {}
                             if node.get("is_video") and node.get("video_url"):
                                 v_candidate = node.get("video_url")
-                                if v_candidate not in slide_video_urls:
+                                if _is_valid_video_url(v_candidate) and v_candidate not in slide_video_urls:
                                     slide_video_urls.append(v_candidate)
                                 _add_candidate(v_candidate)
                             else:
@@ -755,18 +770,43 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                     return res
             candidate_video_urls.clear()
 
-        # 2. Try kkinstagram if Embed page did not yield a working video download
+        # 2. Direct vxinstagram offload MP4 (fast 1-request redirect to real MP4 stream for 2025/2026 Reels)
+        if not slide_image_urls and len(slide_video_urls) <= 1:
+            res = _try_download_candidate(f"https://www.vxinstagram.com/offload/{shortcode}/0.mp4")
+            if res:
+                return res
+
+            try:
+                vx_resp = cffi_requests.get(
+                    f"https://www.vxinstagram.com/reel/{shortcode}/",
+                    headers={"User-Agent": "TelegramBot (like TwitterBot)"},
+                    allow_redirects=True,
+                    timeout=6,
+                )
+                if vx_resp.status_code == 200 and vx_resp.text:
+                    og_m = re.search(
+                        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+                        vx_resp.text,
+                    )
+                    if og_m:
+                        res = _try_download_candidate(html.unescape(og_m.group(1)))
+                        if res:
+                            return res
+            except Exception:
+                pass
+
+        # 3. Try kkinstagram if vxinstagram did not yield a working video download
         if not slide_image_urls and len(slide_video_urls) <= 1:
             try:
                 kk_resp = cffi_requests.get(
                     f"https://www.kkinstagram.com/reel/{shortcode}/",
                     headers={"User-Agent": "TelegramBot (like TwitterBot)"},
                     allow_redirects=False,
-                    timeout=6,
+                    timeout=5,
                 )
                 kk_cand = None
                 loc = kk_resp.headers.get("location")
-                if loc and loc.startswith("http") and (".mp4" in loc or "fbcdn.net" in loc or "cdninstagram.com" in loc):
+                if _is_valid_video_url(loc):
                     kk_cand = loc
                 elif kk_resp.status_code == 200 and kk_resp.text:
                     og_m = re.search(
@@ -779,34 +819,6 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                     res = _try_download_candidate(kk_cand)
                     if res:
                         return res
-            except Exception:
-                pass
-
-        # 3. Try vxinstagram offload MP4 if still no working video download
-        if not slide_image_urls and len(slide_video_urls) <= 1:
-            try:
-                vx_resp = cffi_requests.get(
-                    f"https://www.vxinstagram.com/reel/{shortcode}/",
-                    headers={"User-Agent": "TelegramBot (like TwitterBot)"},
-                    allow_redirects=True,
-                    timeout=7,
-                )
-                if vx_resp.status_code == 200 and vx_resp.text:
-                    if not thumb_url:
-                        img_m = re.search(
-                            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-                            vx_resp.text,
-                        )
-                        if img_m:
-                            thumb_url = html.unescape(img_m.group(1))
-                    og_m = re.search(
-                        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
-                        vx_resp.text,
-                    )
-                    if og_m:
-                        res = _try_download_candidate(html.unescape(og_m.group(1)))
-                        if res:
-                            return res
             except Exception:
                 pass
     except Exception:
