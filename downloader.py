@@ -204,11 +204,10 @@ def _resolve_share_redirects(url: str) -> str:
     try:
         from curl_cffi import requests as cffi_requests
 
-        # 1. Try crawler User-Agents (resolves Instagram /share/ and short links directly without login bounce)
+        # 1. Try crawler User-Agents with tight timeouts so datacenter login bounces never stall inline queries
         curr = url
         crawler_uas = (
             "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-            "WhatsApp/2.24.16.78 A",
             "TelegramBot (like TwitterBot)",
         )
         for ua in crawler_uas:
@@ -217,9 +216,10 @@ def _resolve_share_redirects(url: str) -> str:
                     curr,
                     headers={"User-Agent": ua},
                     allow_redirects=False,
-                    timeout=5,
+                    timeout=3,
                 )
-                loc_bot = _extract_clean_redirect_url(resp_bot.headers.get("location"))
+                raw_loc = resp_bot.headers.get("location") or ""
+                loc_bot = _extract_clean_redirect_url(raw_loc)
                 if loc_bot and loc_bot.split("?")[0].rstrip("/") != curr.split("?")[0].rstrip("/"):
                     if "/share/" not in loc_bot and not REDIRECT_NEEDED_PATTERN.search(loc_bot):
                         return loc_bot
@@ -235,6 +235,8 @@ def _resolve_share_redirects(url: str) -> str:
                         canon_url = _extract_clean_redirect_url(html.unescape(m_canon.group(1)))
                         if canon_url and "/share/" not in canon_url:
                             return canon_url
+                if "/accounts/login" in raw_loc:
+                    break
                 break
 
         # 2. Follow up to 3 redirect hops with Chrome impersonation
@@ -243,7 +245,7 @@ def _resolve_share_redirects(url: str) -> str:
                 curr,
                 impersonate="chrome",
                 allow_redirects=False,
-                timeout=5,
+                timeout=3,
             )
             loc_hop = _extract_clean_redirect_url(resp_hop.headers.get("location"))
             if not loc_hop or loc_hop.split("?")[0].rstrip("/") == curr.split("?")[0].rstrip("/"):
@@ -256,14 +258,15 @@ def _resolve_share_redirects(url: str) -> str:
     except Exception:
         pass
 
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            final_url = _extract_clean_redirect_url(resp.geturl())
-            if final_url and "/share/" not in final_url:
-                return final_url
-    except Exception:
-        pass
+    if "instagram.com/share/" not in url.lower():
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                final_url = _extract_clean_redirect_url(resp.geturl())
+                if final_url and "/share/" not in final_url:
+                    return final_url
+        except Exception:
+            pass
     return url
 
 
@@ -338,18 +341,32 @@ def _resolve_ffmpeg_path() -> str | None:
     global _FFMPEG_PATH_CACHE
     if _FFMPEG_PATH_CACHE:
         return _FFMPEG_PATH_CACHE
+
+    candidates: list[str] = []
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        candidates.append(system_ffmpeg)
     try:
         import imageio_ffmpeg
         exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if exe:
-            _FFMPEG_PATH_CACHE = exe
-            return exe
+        if exe and exe not in candidates:
+            candidates.append(exe)
     except Exception:
         pass
-    system_ffmpeg = shutil.which("ffmpeg")
-    if system_ffmpeg:
-        _FFMPEG_PATH_CACHE = system_ffmpeg
-        return system_ffmpeg
+
+    for cand in candidates:
+        try:
+            proc = subprocess.run(
+                [cand, "-version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            if proc.returncode == 0:
+                _FFMPEG_PATH_CACHE = cand
+                return cand
+        except Exception:
+            continue
     return None
 
 
@@ -404,15 +421,16 @@ def _compress_video_if_needed(
     file_path: Path,
     duration: int | None,
     ffmpeg_path: str | None,
+    force_transcode: bool = False,
 ) -> Path:
     if not file_path.exists():
         return file_path
 
     size_bytes = file_path.stat().st_size
     if not ffmpeg_path:
-        if size_bytes > MAX_FILESIZE_BYTES:
+        if force_transcode or size_bytes > MAX_FILESIZE_BYTES:
             file_path.unlink(missing_ok=True)
-            raise DownloadError("Video exceeds 50 MB and ffmpeg is unavailable for compression.")
+            raise DownloadError("ffmpeg is unavailable on the server to convert this video format.")
         return file_path
 
     vcodec, pix_fmt, p_w, p_h, probed_dur = _probe_video_stream_info(file_path, ffmpeg_path)
@@ -422,10 +440,9 @@ def _compress_video_if_needed(
 
     odd_dims = bool((p_w and p_w % 2 != 0) or (p_h and p_h % 2 != 0))
     needs_size_compression = size_bytes > MAX_FILESIZE_BYTES
-    needs_codec_transcode = vcodec != "h264" or pix_fmt != "yuv420p" or odd_dims
+    needs_codec_transcode = force_transcode or vcodec != "h264" or pix_fmt != "yuv420p" or odd_dims
 
-    # Fast lossless video remux for H.264 (yuv420p) videos <= 49 MB:
-    # converts HE-AAC / xHE-AAC / Opus audio to standard AAC-LC and writes a clean +faststart MP4 container
+    # Fast lossless video remux only for clean non-Instagram H.264 (yuv420p) videos <= 49 MB
     if not needs_size_compression and not needs_codec_transcode:
         remuxed_path = file_path.with_name(f"{file_path.stem}_faststart.mp4")
         remux_cmd = [
@@ -456,8 +473,10 @@ def _compress_video_if_needed(
         try:
             subprocess.run(remux_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
             if remuxed_path.exists() and 1000 < remuxed_path.stat().st_size <= MAX_FILESIZE_BYTES:
-                file_path.unlink(missing_ok=True)
-                return remuxed_path
+                out_vc, out_pf, out_w, out_h, _ = _probe_video_stream_info(remuxed_path, ffmpeg_path)
+                if out_vc == "h264" and out_pf == "yuv420p" and out_w and out_h:
+                    file_path.unlink(missing_ok=True)
+                    return remuxed_path
             remuxed_path.unlink(missing_ok=True)
         except Exception:
             remuxed_path.unlink(missing_ok=True)
@@ -466,13 +485,15 @@ def _compress_video_if_needed(
     target_total_kbps = max(250, int((44 * 8192) / dur))
     audio_kbps = 96 if needs_size_compression else 128
     video_kbps = max(150, target_total_kbps - audio_kbps)
+    safe_cap_kbps = min(2200, video_kbps)
 
     compressed_path = file_path.with_name(f"{file_path.stem}_compressed.mp4")
     scale_filter = (
-        "scale='min(720,iw)':-2,setsar=1:1,format=yuv420p"
-        if needs_size_compression
-        else "scale='trunc(min(1080,iw)/2)*2':'trunc(min(1920,ih)/2)*2',setsar=1:1,format=yuv420p"
+        "scale='trunc(min(720,iw)/2)*2':'trunc(min(1280,ih)/2)*2',setsar=1:1,fps=30,format=yuv420p"
+        if (needs_size_compression or force_transcode)
+        else "scale='trunc(min(1080,iw)/2)*2':'trunc(min(1920,ih)/2)*2',setsar=1:1,fps=30,format=yuv420p"
     )
+    preset = "superfast" if needs_size_compression else "ultrafast"
     cmd = [
         ffmpeg_path,
         "-y",
@@ -497,7 +518,7 @@ def _compress_video_if_needed(
         "-tag:v",
         "avc1",
         "-preset",
-        "superfast",
+        preset,
     ]
     if needs_size_compression:
         cmd += [
@@ -509,7 +530,14 @@ def _compress_video_if_needed(
             f"{video_kbps * 2}k",
         ]
     else:
-        cmd += ["-crf", "23"]
+        cmd += [
+            "-crf",
+            "24",
+            "-maxrate",
+            f"{safe_cap_kbps}k",
+            "-bufsize",
+            f"{safe_cap_kbps * 2}k",
+        ]
 
     cmd += [
         "-c:a",
@@ -535,6 +563,11 @@ def _compress_video_if_needed(
     if not compressed_path.exists() or compressed_path.stat().st_size > MAX_FILESIZE_BYTES:
         compressed_path.unlink(missing_ok=True)
         raise DownloadError("Video still exceeds the 50 MB Telegram limit after compression.")
+
+    out_vc, out_pf, out_w, out_h, _ = _probe_video_stream_info(compressed_path, ffmpeg_path)
+    if out_vc != "h264" or out_pf != "yuv420p" or not out_w or not out_h:
+        compressed_path.unlink(missing_ok=True)
+        raise DownloadError("Converted video failed Telegram stream compatibility verification.")
 
     return compressed_path
 
@@ -696,7 +729,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
         low = u.lower()
         if any(img_marker in low for img_marker in (".jpg", ".jpeg", ".png", ".webp", "stp=dst-jpg", "/t51.")):
             return False
-        return ".mp4" in low or "/o1/v/t2/" in low or "/v/t50." in low
+        return ".mp4" in low or "/o1/v/t2/" in low or "/o1/v/t16/" in low or "/v/t50." in low
 
     def _add_candidate(u: str | None) -> None:
         if _is_valid_video_url(u) and u not in candidate_video_urls:
@@ -710,7 +743,12 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
         try:
             _download_cffi_or_urllib(cand_url, video_dest)  # type: ignore[arg-type]
             if video_dest.exists() and video_dest.stat().st_size > 1000:
-                video_dest = _compress_video_if_needed(video_dest, dur_int, ffmpeg_path)
+                video_dest = _compress_video_if_needed(
+                    video_dest,
+                    dur_int,
+                    ffmpeg_path,
+                    force_transcode=True,
+                )
                 return VideoData(
                     file_path=video_dest,
                     title=title[:200],
@@ -725,6 +763,8 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
         except Exception:
             video_dest.unlink(missing_ok=True)
         return None
+
+    is_reel_url = "/reel/" in url.lower() or "/reels/" in url.lower()
 
     try:
         from curl_cffi import requests as cffi_requests
@@ -754,7 +794,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                         "doc_id": "27130156389949648",
                     },
                     impersonate="chrome",
-                    timeout=5,
+                    timeout=3.5,
                 )
                 if gql_resp.status_code == 200:
                     gql_json = gql_resp.json()
@@ -808,13 +848,19 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                     return res
             candidate_video_urls.clear()
 
-        # 2. Instagram Embed Captioned page (fallback for older posts and carousels)
+        # 2a. For Reels on datacenter IPs where Instagram gated GraphQL, jump straight to vxinstagram offload
+        if is_reel_url and not slide_image_urls and len(slide_video_urls) <= 1:
+            res = _try_download_candidate(f"https://www.vxinstagram.com/offload/{shortcode}/0.mp4")
+            if res:
+                return res
+
+        # 2b. Instagram Embed Captioned page (fallback for /p/ posts and carousels)
         if not slide_image_urls and len(slide_video_urls) <= 1:
             try:
                 emb_resp = cffi_requests.get(
                     f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
                     impersonate="chrome",
-                    timeout=5,
+                    timeout=3.5,
                 )
                 if emb_resp.status_code == 200 and emb_resp.text:
                     html_text = emb_resp.text
@@ -872,18 +918,19 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                     return res
             candidate_video_urls.clear()
 
-        # 3. Direct vxinstagram offload MP4 (fast 1-request redirect to real MP4 stream for 2025/2026 Reels)
+        # 3. Direct vxinstagram offload MP4 (for non-reel /p/ video URLs or if not yet attempted)
         if not slide_image_urls and len(slide_video_urls) <= 1:
-            res = _try_download_candidate(f"https://www.vxinstagram.com/offload/{shortcode}/0.mp4")
-            if res:
-                return res
+            if not is_reel_url:
+                res = _try_download_candidate(f"https://www.vxinstagram.com/offload/{shortcode}/0.mp4")
+                if res:
+                    return res
 
             try:
                 vx_resp = cffi_requests.get(
                     f"https://www.vxinstagram.com/reel/{shortcode}/",
                     headers={"User-Agent": "TelegramBot (like TwitterBot)"},
                     allow_redirects=True,
-                    timeout=6,
+                    timeout=5,
                 )
                 if vx_resp.status_code == 200 and vx_resp.text:
                     og_m = re.search(
@@ -897,14 +944,14 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
             except Exception:
                 pass
 
-        # 3. Try kkinstagram if vxinstagram did not yield a working video download
+        # 4. Try kkinstagram if vxinstagram did not yield a working video download
         if not slide_image_urls and len(slide_video_urls) <= 1:
             try:
                 kk_resp = cffi_requests.get(
                     f"https://www.kkinstagram.com/reel/{shortcode}/",
                     headers={"User-Agent": "TelegramBot (like TwitterBot)"},
                     allow_redirects=False,
-                    timeout=5,
+                    timeout=4,
                 )
                 kk_cand = None
                 loc = kk_resp.headers.get("location")
@@ -938,7 +985,12 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
             try:
                 _download_cffi_or_urllib(v_url, v_dest)
                 if v_dest.exists() and v_dest.stat().st_size > 1000:
-                    v_dest = _compress_video_if_needed(v_dest, dur_int, ffmpeg_path)
+                    v_dest = _compress_video_if_needed(
+                        v_dest,
+                        dur_int,
+                        ffmpeg_path,
+                        force_transcode=True,
+                    )
                     video_paths.append(v_dest)
             except Exception:
                 v_dest.unlink(missing_ok=True)
@@ -1162,6 +1214,11 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
             return tikwm_res
 
     is_instagram = "instagram.com" in resolved_url.lower() or "instagr.am" in resolved_url.lower()
+    if is_instagram and "/share/" in resolved_url.lower() and not COOKIES_FILE.exists():
+        raise DownloadError(
+            "Instagram blocked resolving this /share/ short link from the server IP. "
+            "Open the Reel and copy the direct /reel/... link, or send cookies.txt to the bot."
+        )
     if is_instagram and not COOKIES_FILE.exists():
         ig_res = _try_instagram_fallback(resolved_url, unique_id, ffmpeg_path)
         if ig_res:
@@ -1238,7 +1295,12 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
             ):
                 direct_url = None
 
-            downloaded_path = _compress_video_if_needed(downloaded_path, dur_int, ffmpeg_path)
+            downloaded_path = _compress_video_if_needed(
+                downloaded_path,
+                dur_int,
+                ffmpeg_path,
+                force_transcode=is_instagram,
+            )
 
             return VideoData(
                 file_path=downloaded_path,

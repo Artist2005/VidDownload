@@ -950,20 +950,23 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
     cached_media = storage.get_cached_media(url)
 
     if not cached_media:
-        try:
-            prep_task = asyncio.create_task(
-                _prepare_and_cache_video_for_inline(
-                    url,
-                    bot,
-                    inline_query.from_user.id,
-                )
+        prep_task = asyncio.create_task(
+            _prepare_and_cache_video_for_inline(
+                url,
+                bot,
+                inline_query.from_user.id,
             )
+        )
+        prep_task.add_done_callback(
+            lambda t: t.exception() if not t.cancelled() else None
+        )
+        try:
             cached_media, _ = await asyncio.wait_for(
                 asyncio.shield(prep_task),
-                timeout=9.0,
+                timeout=2.8,
             )
         except asyncio.TimeoutError:
-            logger.info("Inline download exceeded 9.0s timeout for %s, falling back to placeholder card", url)
+            logger.info("Inline download exceeded 2.8s fast window for %s, showing instant card while continuing in background", url)
         except Exception as exc:
             logger.warning("Inline direct download failed for %s: %s", url, exc)
 

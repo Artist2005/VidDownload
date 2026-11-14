@@ -78,7 +78,7 @@ class BotStorage:
         self._locks: dict[str, asyncio.Lock] = {}
         self._load()
 
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     def _load(self) -> None:
         if not self.cache_path.exists():
@@ -210,6 +210,9 @@ class BotStorage:
         for prefix in ("cached_", "direct_", "load_", "hist_"):
             if clean_id.startswith(prefix):
                 clean_id = clean_id[len(prefix):]
+                if clean_id.startswith("v") and "_" in clean_id:
+                    parts = clean_id.split("_")
+                    clean_id = parts[-1]
                 break
         return self.url_by_id.get(clean_id) or self.url_by_id.get(result_id)
 
