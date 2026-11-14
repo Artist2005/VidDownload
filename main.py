@@ -131,7 +131,7 @@ def _loading_keyboard(result_id: str, platform: str = "Video") -> InlineKeyboard
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"Tap to Load Video ({platform})",
+                    text=f"Loading {platform} video...",
                     callback_data=f"inline_dl:{result_id}",
                 )
             ]
@@ -311,8 +311,6 @@ async def _prepare_and_cache_video_for_inline(
 
             for target_chat in candidate_chats:
                 try:
-                    if target_chat != saved_chat:
-                        await bot.send_chat_action(chat_id=target_chat, action=ChatAction.UPLOAD_VIDEO)
                     temp_msg = await bot.send_video(
                         chat_id=target_chat,
                         video=FSInputFile(upload_path),
@@ -963,10 +961,10 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
         try:
             cached_media, _ = await asyncio.wait_for(
                 asyncio.shield(prep_task),
-                timeout=2.8,
+                timeout=8.0,
             )
         except asyncio.TimeoutError:
-            logger.info("Inline download exceeded 2.8s fast window for %s, showing instant card while continuing in background", url)
+            logger.info("Inline download exceeded 8.0s window for %s, falling back to auto-replacing placeholder", url)
         except Exception as exc:
             logger.warning("Inline direct download failed for %s: %s", url, exc)
 

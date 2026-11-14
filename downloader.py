@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -66,6 +67,19 @@ USER_AGENT = (
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 FAST_META_CACHE: dict[str, "VideoData"] = {}
 RESOLVED_URL_CACHE: dict[str, str] = {}
+_PROBED_STREAM_CACHE: dict[str, tuple[int | None, int | None, int | None]] = {}
+_THREAD_LOCAL = threading.local()
+_IG_GRAPHQL_BLOCKED_UNTIL: float = 0.0
+
+
+def _get_cffi_session():
+    sess = getattr(_THREAD_LOCAL, "cffi_session", None)
+    if sess is None:
+        from curl_cffi import requests as cffi_requests
+
+        sess = cffi_requests.Session(impersonate="chrome")
+        _THREAD_LOCAL.cffi_session = sess
+    return sess
 
 
 def get_fast_meta(url: str) -> "VideoData | None":
@@ -95,6 +109,15 @@ class VideoData:
 
     def __post_init__(self) -> None:
         if self.file_path and self.file_path.exists():
+            cached_probe = _PROBED_STREAM_CACHE.pop(str(self.file_path), None)
+            if cached_probe:
+                p_w, p_h, p_dur = cached_probe
+                if p_w and p_h:
+                    self.width = p_w
+                    self.height = p_h
+                if p_dur:
+                    self.duration = p_dur
+                return
             ffmpeg_path = _resolve_ffmpeg_path()
             if ffmpeg_path:
                 _, _, p_w, p_h, p_dur = _probe_video_stream_info(self.file_path, ffmpeg_path)
@@ -473,8 +496,9 @@ def _compress_video_if_needed(
         try:
             subprocess.run(remux_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
             if remuxed_path.exists() and 1000 < remuxed_path.stat().st_size <= MAX_FILESIZE_BYTES:
-                out_vc, out_pf, out_w, out_h, _ = _probe_video_stream_info(remuxed_path, ffmpeg_path)
+                out_vc, out_pf, out_w, out_h, out_dur = _probe_video_stream_info(remuxed_path, ffmpeg_path)
                 if out_vc == "h264" and out_pf == "yuv420p" and out_w and out_h:
+                    _PROBED_STREAM_CACHE[str(remuxed_path)] = (out_w, out_h, out_dur)
                     file_path.unlink(missing_ok=True)
                     return remuxed_path
             remuxed_path.unlink(missing_ok=True)
@@ -483,20 +507,28 @@ def _compress_video_if_needed(
 
     dur = max(duration or probed_dur or 60, 5)
     target_total_kbps = max(250, int((44 * 8192) / dur))
-    audio_kbps = 96 if needs_size_compression else 128
+    audio_kbps = 96 if (needs_size_compression or force_transcode) else 128
     video_kbps = max(150, target_total_kbps - audio_kbps)
-    safe_cap_kbps = min(2200, video_kbps)
+    source_kbps = int((size_bytes * 8) / (1000 * max(probed_dur or 15, 1)))
+    if force_transcode:
+        safe_cap_kbps = min(1450, max(650, int(source_kbps * 1.15)), video_kbps)
+    else:
+        safe_cap_kbps = min(2200, video_kbps)
 
     compressed_path = file_path.with_name(f"{file_path.stem}_compressed.mp4")
-    scale_filter = (
-        "scale='trunc(min(720,iw)/2)*2':'trunc(min(1280,ih)/2)*2',setsar=1:1,fps=30,format=yuv420p"
-        if (needs_size_compression or force_transcode)
-        else "scale='trunc(min(1080,iw)/2)*2':'trunc(min(1920,ih)/2)*2',setsar=1:1,fps=30,format=yuv420p"
-    )
+    if force_transcode and dur > 30:
+        scale_filter = "scale='trunc(min(576,iw)/2)*2':'trunc(min(1024,ih)/2)*2',setsar=1:1,fps=30,format=yuv420p"
+    elif needs_size_compression or force_transcode:
+        scale_filter = "scale='trunc(min(720,iw)/2)*2':'trunc(min(1280,ih)/2)*2',setsar=1:1,fps=30,format=yuv420p"
+    else:
+        scale_filter = "scale='trunc(min(1080,iw)/2)*2':'trunc(min(1920,ih)/2)*2',setsar=1:1,fps=30,format=yuv420p"
+
     preset = "superfast" if needs_size_compression else "ultrafast"
     cmd = [
         ffmpeg_path,
         "-y",
+        "-threads",
+        "0",
         "-i",
         str(file_path),
         "-map",
@@ -519,6 +551,8 @@ def _compress_video_if_needed(
         "avc1",
         "-preset",
         preset,
+        "-tune",
+        "fastdecode",
     ]
     if needs_size_compression:
         cmd += [
@@ -532,7 +566,7 @@ def _compress_video_if_needed(
     else:
         cmd += [
             "-crf",
-            "24",
+            "26" if force_transcode else "24",
             "-maxrate",
             f"{safe_cap_kbps}k",
             "-bufsize",
@@ -564,11 +598,12 @@ def _compress_video_if_needed(
         compressed_path.unlink(missing_ok=True)
         raise DownloadError("Video still exceeds the 50 MB Telegram limit after compression.")
 
-    out_vc, out_pf, out_w, out_h, _ = _probe_video_stream_info(compressed_path, ffmpeg_path)
+    out_vc, out_pf, out_w, out_h, out_dur = _probe_video_stream_info(compressed_path, ffmpeg_path)
     if out_vc != "h264" or out_pf != "yuv420p" or not out_w or not out_h:
         compressed_path.unlink(missing_ok=True)
         raise DownloadError("Converted video failed Telegram stream compatibility verification.")
 
+    _PROBED_STREAM_CACHE[str(compressed_path)] = (out_w, out_h, out_dur)
     return compressed_path
 
 
@@ -597,12 +632,17 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
         return None
 
     api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}"
-    req = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        sess = _get_cffi_session()
+        resp = sess.get(api_url, timeout=8)
+        payload = resp.json()
     except Exception:
-        return None
+        req = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp_u:
+                payload = json.loads(resp_u.read().decode("utf-8"))
+        except Exception:
+            return None
 
     if payload.get("code") != 0 or not payload.get("data"):
         return None
@@ -676,9 +716,8 @@ def _try_tikwm_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> Vi
 
 def _download_cffi_or_urllib(url: str, dest: Path) -> None:
     try:
-        from curl_cffi import requests as cffi_requests
-
-        resp = cffi_requests.get(url, impersonate="chrome", timeout=20)
+        sess = _get_cffi_session()
+        resp = sess.get(url, timeout=18)
         if resp.status_code in (403, 404, 410):
             raise DownloadError(f"CDN returned HTTP {resp.status_code}")
         if resp.status_code == 200 and len(resp.content) > 1000:
@@ -708,6 +747,7 @@ def _instagram_shortcode_to_pk(shortcode: str) -> str | None:
 
 
 def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> VideoData | None:
+    global _IG_GRAPHQL_BLOCKED_UNTIL
     match = INSTAGRAM_SHORTCODE_PATTERN.search(url)
     if not match:
         return None
@@ -767,13 +807,13 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
     is_reel_url = "/reel/" in url.lower() or "/reels/" in url.lower()
 
     try:
-        from curl_cffi import requests as cffi_requests
+        sess = _get_cffi_session()
 
-        # 1. Instagram PolarisLoggedOutDesktopWWWPostRootContentQuery GraphQL API (fastest, works on 2025/2026 Reels & carousels)
+        # 1. Instagram Polaris GraphQL API (skipped immediately for 30m if server IP was gated by Meta)
         media_pk = _instagram_shortcode_to_pk(shortcode)
-        if media_pk:
+        if media_pk and time.time() >= _IG_GRAPHQL_BLOCKED_UNTIL:
             try:
-                gql_resp = cffi_requests.post(
+                gql_resp = sess.post(
                     "https://www.instagram.com/api/graphql",
                     headers={
                         "X-IG-App-ID": "936619743392459",
@@ -793,16 +833,19 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                         "variables": json.dumps({"media_id": media_pk}, separators=(",", ":")),
                         "doc_id": "27130156389949648",
                     },
-                    impersonate="chrome",
-                    timeout=3.5,
+                    timeout=2.2,
                 )
-                if gql_resp.status_code == 200:
+                if gql_resp.status_code in (401, 403, 429):
+                    _IG_GRAPHQL_BLOCKED_UNTIL = time.time() + 1800
+                elif gql_resp.status_code == 200:
                     gql_json = gql_resp.json()
                     p_media = (
                         ((gql_json.get("data") or {}).get("xig_polaris_media") or {}).get("if_not_gated_logged_out")
                         or {}
                     )
-                    if p_media:
+                    if not p_media and is_reel_url:
+                        _IG_GRAPHQL_BLOCKED_UNTIL = time.time() + 1800
+                    elif p_media:
                         p_user = p_media.get("user") or p_media.get("owner") or {}
                         author = (p_user.get("username") or p_user.get("full_name") or "").strip()
                         p_cap = p_media.get("caption")
@@ -839,7 +882,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                                 if img_u and img_u not in slide_image_urls:
                                     slide_image_urls.append(img_u)
             except Exception:
-                pass
+                _IG_GRAPHQL_BLOCKED_UNTIL = time.time() + 600
 
         if candidate_video_urls and len(slide_video_urls) <= 1 and not (slide_video_urls and slide_image_urls):
             for cand in list(candidate_video_urls):
@@ -855,12 +898,11 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                 return res
 
         # 2b. Instagram Embed Captioned page (fallback for /p/ posts and carousels)
-        if not slide_image_urls and len(slide_video_urls) <= 1:
+        if not slide_image_urls and len(slide_video_urls) <= 1 and time.time() >= _IG_GRAPHQL_BLOCKED_UNTIL:
             try:
-                emb_resp = cffi_requests.get(
+                emb_resp = sess.get(
                     f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
-                    impersonate="chrome",
-                    timeout=3.5,
+                    timeout=2.5,
                 )
                 if emb_resp.status_code == 200 and emb_resp.text:
                     html_text = emb_resp.text
@@ -926,7 +968,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                     return res
 
             try:
-                vx_resp = cffi_requests.get(
+                vx_resp = sess.get(
                     f"https://www.vxinstagram.com/reel/{shortcode}/",
                     headers={"User-Agent": "TelegramBot (like TwitterBot)"},
                     allow_redirects=True,
@@ -947,7 +989,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
         # 4. Try kkinstagram if vxinstagram did not yield a working video download
         if not slide_image_urls and len(slide_video_urls) <= 1:
             try:
-                kk_resp = cffi_requests.get(
+                kk_resp = sess.get(
                     f"https://www.kkinstagram.com/reel/{shortcode}/",
                     headers={"User-Agent": "TelegramBot (like TwitterBot)"},
                     allow_redirects=False,
