@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction, ChatMemberStatus, ChatType, ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -131,7 +131,7 @@ def _loading_keyboard(result_id: str, platform: str = "Video") -> InlineKeyboard
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"Loading {platform} video...",
+                    text=f"Sending {platform} video...",
                     callback_data=f"inline_dl:{result_id}",
                 )
             ]
@@ -192,7 +192,7 @@ def _build_home_text(bot_username: str) -> str:
         f"<b>Three ways to use:</b>\n"
         f"1. <b>Direct Message.</b> Paste any video link right here.\n"
         f"2. <b>Inline Mode (@) in any chat.</b> Type in the message input:\n"
-        f"<code>@{bot_username} link</code>, wait 2-3 seconds for the video card to appear, and tap it to send the video directly.\n"
+        f"<code>@{bot_username} link</code>, wait 1-2 seconds for the card to appear, and tap it to send the video automatically.\n"
         f"3. <b>Group Chats.</b> Add me to a group and I will automatically reply with the video file whenever someone shares a link."
     )
 
@@ -220,8 +220,8 @@ def _build_help_text(bot_username: str) -> str:
     return (
         "<b>How to Use the Bot:</b>\n\n"
         "<b>Inline Mode & History (@):</b>\n"
-        f"In any chat or channel, type <code>@{bot_username} link</code> and wait 2-3 seconds. "
-        "The bot will prepare the video right in the popup list so when you tap it, the video file is sent immediately.\n\n"
+        f"In any chat or channel, type <code>@{bot_username} link</code> and wait 1-2 seconds. "
+        "Tap the popup card and the video file is sent automatically.\n\n"
         "<b>Batch Downloading:</b>\n"
         "You can send up to 5 links in one message, and the bot will download each of them in order.\n\n"
         "<b>Updating cookies.txt (Admin):</b>\n"
@@ -961,10 +961,10 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
         try:
             cached_media, _ = await asyncio.wait_for(
                 asyncio.shield(prep_task),
-                timeout=8.0,
+                timeout=1.6,
             )
         except asyncio.TimeoutError:
-            logger.info("Inline download exceeded 8.0s window for %s, falling back to auto-replacing placeholder", url)
+            logger.info("Inline fast window (1.6s) elapsed for %s, returning instant card while background download finishes", url)
         except Exception as exc:
             logger.warning("Inline direct download failed for %s: %s", url, exc)
 
@@ -980,7 +980,7 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
             reply_markup=_video_keyboard(result_id, url),
         )
         try:
-            await inline_query.answer([cached_video], cache_time=5, is_personal=False)
+            await inline_query.answer([cached_video], cache_time=60, is_personal=False)
             return
         except TelegramBadRequest as exc:
             logger.warning("Inline answer with cached_video failed for %s: %s", url, exc)
@@ -988,16 +988,16 @@ async def handle_inline_query(inline_query: InlineQuery, bot: Bot) -> None:
     download_article = InlineQueryResultArticle(
         id=f"load_{result_id}",
         title=f"Send Video from {platform}",
-        description=f"Tap here to send the video to chat ({url[:60]})",
+        description=f"Tap to send, video appears automatically ({url[:55]})",
         input_message_content=InputTextMessageContent(
-            message_text=f"<b>Loading video from {platform}...</b>",
+            message_text=f"<b>Sending video from {platform}...</b>",
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         ),
         reply_markup=_loading_keyboard(result_id, platform),
     )
     try:
-        await inline_query.answer([download_article], cache_time=1, is_personal=False)
+        await inline_query.answer([download_article], cache_time=0, is_personal=True)
     except TelegramBadRequest as exc:
         logger.warning("Inline answer with download_article failed for %s: %s", url, exc)
 
@@ -1027,16 +1027,28 @@ async def _replace_inline_message_with_video(
             return
 
         caption = cached_media.caption or build_caption(url, cached_media.title, cached_media.author)
-        await bot.edit_message_media(
-            inline_message_id=inline_message_id,
-            media=InputMediaVideo(
-                media=cached_media.file_id,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                supports_streaming=True,
-            ),
-            reply_markup=_video_keyboard(result_id, url),
-        )
+        for attempt in range(3):
+            try:
+                await bot.edit_message_media(
+                    inline_message_id=inline_message_id,
+                    media=InputMediaVideo(
+                        media=cached_media.file_id,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                        supports_streaming=True,
+                    ),
+                    reply_markup=_video_keyboard(result_id, url),
+                )
+                return
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(min(float(exc.retry_after), 3.0))
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+                if attempt < 2:
+                    await asyncio.sleep(0.4 * (attempt + 1))
+                else:
+                    raise
     except DownloadError as exc:
         logger.warning("Download error (%s): %s", url, exc)
         if is_placeholder:
@@ -1076,6 +1088,7 @@ async def handle_chosen_inline_result(chosen: ChosenInlineResult, bot: Bot) -> N
     if not url:
         return
 
+    logger.info("Auto-replacing inline message %s for %s", inline_message_id, url)
     await _replace_inline_message_with_video(
         inline_message_id=inline_message_id,
         url=url,

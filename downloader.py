@@ -120,7 +120,7 @@ class VideoData:
                 return
             ffmpeg_path = _resolve_ffmpeg_path()
             if ffmpeg_path:
-                _, _, p_w, p_h, p_dur = _probe_video_stream_info(self.file_path, ffmpeg_path)
+                _, _, p_w, p_h, p_dur, _ = _probe_video_stream_info(self.file_path, ffmpeg_path)
                 if p_w and p_h:
                     self.width = p_w
                     self.height = p_h
@@ -224,8 +224,11 @@ def _extract_clean_redirect_url(candidate: str | None) -> str | None:
 def _resolve_share_redirects(url: str) -> str:
     if not REDIRECT_NEEDED_PATTERN.search(url):
         return url
+    cached = RESOLVED_URL_CACHE.get(url)
+    if cached:
+        return cached
     try:
-        from curl_cffi import requests as cffi_requests
+        sess = _get_cffi_session()
 
         # 1. Try crawler User-Agents with tight timeouts so datacenter login bounces never stall inline queries
         curr = url
@@ -235,16 +238,17 @@ def _resolve_share_redirects(url: str) -> str:
         )
         for ua in crawler_uas:
             for _ in range(3):
-                resp_bot = cffi_requests.get(
+                resp_bot = sess.get(
                     curr,
                     headers={"User-Agent": ua},
                     allow_redirects=False,
-                    timeout=3,
+                    timeout=2.5,
                 )
                 raw_loc = resp_bot.headers.get("location") or ""
                 loc_bot = _extract_clean_redirect_url(raw_loc)
                 if loc_bot and loc_bot.split("?")[0].rstrip("/") != curr.split("?")[0].rstrip("/"):
                     if "/share/" not in loc_bot and not REDIRECT_NEEDED_PATTERN.search(loc_bot):
+                        RESOLVED_URL_CACHE[url] = loc_bot
                         return loc_bot
                     curr = loc_bot
                     continue
@@ -257,6 +261,7 @@ def _resolve_share_redirects(url: str) -> str:
                     if m_canon:
                         canon_url = _extract_clean_redirect_url(html.unescape(m_canon.group(1)))
                         if canon_url and "/share/" not in canon_url:
+                            RESOLVED_URL_CACHE[url] = canon_url
                             return canon_url
                 if "/accounts/login" in raw_loc:
                     break
@@ -264,19 +269,20 @@ def _resolve_share_redirects(url: str) -> str:
 
         # 2. Follow up to 3 redirect hops with Chrome impersonation
         for _ in range(3):
-            resp_hop = cffi_requests.get(
+            resp_hop = sess.get(
                 curr,
-                impersonate="chrome",
                 allow_redirects=False,
-                timeout=3,
+                timeout=2.5,
             )
             loc_hop = _extract_clean_redirect_url(resp_hop.headers.get("location"))
             if not loc_hop or loc_hop.split("?")[0].rstrip("/") == curr.split("?")[0].rstrip("/"):
                 break
             if "/share/" not in loc_hop and not REDIRECT_NEEDED_PATTERN.search(loc_hop):
+                RESOLVED_URL_CACHE[url] = loc_hop
                 return loc_hop
             curr = loc_hop
         if curr != url and "/share/" not in curr:
+            RESOLVED_URL_CACHE[url] = curr
             return curr
     except Exception:
         pass
@@ -284,9 +290,10 @@ def _resolve_share_redirects(url: str) -> str:
     if "instagram.com/share/" not in url.lower():
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=4) as resp:
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
                 final_url = _extract_clean_redirect_url(resp.geturl())
                 if final_url and "/share/" not in final_url:
+                    RESOLVED_URL_CACHE[url] = final_url
                     return final_url
         except Exception:
             pass
@@ -396,9 +403,9 @@ def _resolve_ffmpeg_path() -> str | None:
 def _probe_video_stream_info(
     file_path: Path,
     ffmpeg_path: str | None,
-) -> tuple[str, str, int | None, int | None, int | None]:
+) -> tuple[str, str, int | None, int | None, int | None, bool]:
     if not ffmpeg_path or not file_path.exists():
-        return "", "", None, None, None
+        return "", "", None, None, None, False
     try:
         proc = subprocess.run(
             [ffmpeg_path, "-hide_banner", "-i", str(file_path)],
@@ -410,7 +417,7 @@ def _probe_video_stream_info(
         )
         info_txt = proc.stderr or ""
         if re.search(r"Input #\d+,\s*(?:image2|jpeg_pipe|png_pipe|webp_pipe|gif|bmp_pipe)", info_txt, re.IGNORECASE):
-            return "", "", None, None, None
+            return "", "", None, None, None, False
 
         dur_int: int | None = None
         m_dur = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", info_txt)
@@ -420,11 +427,11 @@ def _probe_video_stream_info(
 
         m_vid = re.search(r"Stream #\d+:\d+[^\n]*Video:\s*([a-zA-Z0-9_]+)([^\n]*)", info_txt)
         if not m_vid:
-            return "", "", None, None, dur_int
+            return "", "", None, None, dur_int, False
 
         vcodec = m_vid.group(1).lower()
         if vcodec in ("mjpeg", "png", "webp", "gif", "bmp", "tiff", "jpeg2000", "apng"):
-            return "", "", None, None, None
+            return "", "", None, None, None, False
         rest = m_vid.group(2)
         pix_fmt = "yuv420p" if ("yuv420p" in rest and "yuvj420p" not in rest and "yuv420p10" not in rest) else "other"
 
@@ -434,10 +441,15 @@ def _probe_video_stream_info(
         if m_res:
             width = int(m_res.group(1))
             height = int(m_res.group(2))
+            if re.search(r"rotation of -?(?:90|270)", info_txt):
+                width, height = height, width
 
-        return vcodec, pix_fmt, width, height, dur_int
+        has_audio = bool(re.search(r"Stream #\d+:\d+[^\n]*Audio:", info_txt))
+        has_aac_lc = (not has_audio) or bool(re.search(r"Stream #\d+:\d+[^\n]*Audio:\s*aac\s*\(LC\)", info_txt))
+
+        return vcodec, pix_fmt, width, height, dur_int, has_aac_lc
     except Exception:
-        return "", "", None, None, None
+        return "", "", None, None, None, False
 
 
 def _compress_video_if_needed(
@@ -456,7 +468,7 @@ def _compress_video_if_needed(
             raise DownloadError("ffmpeg is unavailable on the server to convert this video format.")
         return file_path
 
-    vcodec, pix_fmt, p_w, p_h, probed_dur = _probe_video_stream_info(file_path, ffmpeg_path)
+    vcodec, pix_fmt, p_w, p_h, probed_dur, has_aac_lc = _probe_video_stream_info(file_path, ffmpeg_path)
     if not vcodec:
         file_path.unlink(missing_ok=True)
         raise DownloadError("Downloaded file does not contain a valid video stream.")
@@ -468,6 +480,11 @@ def _compress_video_if_needed(
     # Fast lossless video remux only for clean non-Instagram H.264 (yuv420p) videos <= 49 MB
     if not needs_size_compression and not needs_codec_transcode:
         remuxed_path = file_path.with_name(f"{file_path.stem}_faststart.mp4")
+        audio_args = (
+            ["-c:a", "copy"]
+            if has_aac_lc
+            else ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
+        )
         remux_cmd = [
             ffmpeg_path,
             "-y",
@@ -481,14 +498,7 @@ def _compress_video_if_needed(
             "copy",
             "-tag:v",
             "avc1",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
+            *audio_args,
             "-movflags",
             "+faststart",
             str(remuxed_path),
@@ -496,7 +506,11 @@ def _compress_video_if_needed(
         try:
             subprocess.run(remux_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
             if remuxed_path.exists() and 1000 < remuxed_path.stat().st_size <= MAX_FILESIZE_BYTES:
-                out_vc, out_pf, out_w, out_h, out_dur = _probe_video_stream_info(remuxed_path, ffmpeg_path)
+                if p_w and p_h:
+                    _PROBED_STREAM_CACHE[str(remuxed_path)] = (p_w, p_h, probed_dur or duration)
+                    file_path.unlink(missing_ok=True)
+                    return remuxed_path
+                out_vc, out_pf, out_w, out_h, out_dur, _ = _probe_video_stream_info(remuxed_path, ffmpeg_path)
                 if out_vc == "h264" and out_pf == "yuv420p" and out_w and out_h:
                     _PROBED_STREAM_CACHE[str(remuxed_path)] = (out_w, out_h, out_dur)
                     file_path.unlink(missing_ok=True)
@@ -511,17 +525,25 @@ def _compress_video_if_needed(
     video_kbps = max(150, target_total_kbps - audio_kbps)
     source_kbps = int((size_bytes * 8) / (1000 * max(probed_dur or 15, 1)))
     if force_transcode:
-        safe_cap_kbps = min(1450, max(650, int(source_kbps * 1.15)), video_kbps)
+        safe_cap_kbps = min(1350, max(600, int(source_kbps * 1.1)), video_kbps)
     else:
         safe_cap_kbps = min(2200, video_kbps)
 
     compressed_path = file_path.with_name(f"{file_path.stem}_compressed.mp4")
-    if force_transcode and dur > 30:
-        scale_filter = "scale='trunc(min(576,iw)/2)*2':'trunc(min(1024,ih)/2)*2',setsar=1:1,fps=30,format=yuv420p"
-    elif needs_size_compression or force_transcode:
-        scale_filter = "scale='trunc(min(720,iw)/2)*2':'trunc(min(1280,ih)/2)*2',setsar=1:1,fps=30,format=yuv420p"
+    if force_transcode and dur > 20:
+        max_side = 854
+    elif force_transcode:
+        max_side = 1024
+    elif needs_size_compression:
+        max_side = 1280
     else:
-        scale_filter = "scale='trunc(min(1080,iw)/2)*2':'trunc(min(1920,ih)/2)*2',setsar=1:1,fps=30,format=yuv420p"
+        max_side = 1920
+
+    scale_filter = (
+        f"scale=w='trunc(iw*min(1\\,{max_side}/max(iw\\,ih))/2)*2':"
+        f"h='trunc(ih*min(1\\,{max_side}/max(iw\\,ih))/2)*2',"
+        "setsar=1:1,fps=30,format=yuv420p"
+    )
 
     preset = "superfast" if needs_size_compression else "ultrafast"
     cmd = [
@@ -598,7 +620,14 @@ def _compress_video_if_needed(
         compressed_path.unlink(missing_ok=True)
         raise DownloadError("Video still exceeds the 50 MB Telegram limit after compression.")
 
-    out_vc, out_pf, out_w, out_h, out_dur = _probe_video_stream_info(compressed_path, ffmpeg_path)
+    if p_w and p_h and compressed_path.stat().st_size > 1000:
+        ratio = min(1.0, max_side / max(p_w, p_h))
+        calc_w = max(2, int(p_w * ratio) // 2 * 2)
+        calc_h = max(2, int(p_h * ratio) // 2 * 2)
+        _PROBED_STREAM_CACHE[str(compressed_path)] = (calc_w, calc_h, probed_dur or duration)
+        return compressed_path
+
+    out_vc, out_pf, out_w, out_h, out_dur, _ = _probe_video_stream_info(compressed_path, ffmpeg_path)
     if out_vc != "h264" or out_pf != "yuv420p" or not out_w or not out_h:
         compressed_path.unlink(missing_ok=True)
         raise DownloadError("Converted video failed Telegram stream compatibility verification.")
@@ -833,10 +862,10 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                         "variables": json.dumps({"media_id": media_pk}, separators=(",", ":")),
                         "doc_id": "27130156389949648",
                     },
-                    timeout=2.2,
+                    timeout=1.2,
                 )
                 if gql_resp.status_code in (401, 403, 429):
-                    _IG_GRAPHQL_BLOCKED_UNTIL = time.time() + 1800
+                    _IG_GRAPHQL_BLOCKED_UNTIL = time.time() + 3600
                 elif gql_resp.status_code == 200:
                     gql_json = gql_resp.json()
                     p_media = (
@@ -844,7 +873,7 @@ def _try_instagram_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -
                         or {}
                     )
                     if not p_media and is_reel_url:
-                        _IG_GRAPHQL_BLOCKED_UNTIL = time.time() + 1800
+                        _IG_GRAPHQL_BLOCKED_UNTIL = time.time() + 3600
                     elif p_media:
                         p_user = p_media.get("user") or p_media.get("owner") or {}
                         author = (p_user.get("username") or p_user.get("full_name") or "").strip()
@@ -1096,9 +1125,8 @@ def _try_twitter_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> 
     api_url = f"https://api.vxtwitter.com/{username}/status/{status_id}"
 
     try:
-        from curl_cffi import requests as cffi_requests
-
-        resp = cffi_requests.get(api_url, impersonate="chrome", timeout=12)
+        sess = _get_cffi_session()
+        resp = sess.get(api_url, timeout=8)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -1148,14 +1176,13 @@ def _try_reddit_fallback(url: str, unique_id: str, ffmpeg_path: str | None) -> V
     if "reddit.com" not in url.lower() and "redd.it" not in url.lower():
         return None
     try:
-        from curl_cffi import requests as cffi_requests
-
+        sess = _get_cffi_session()
         rx_url = re.sub(r"https?://(?:[\w-]+\.)?reddit\.com", "https://rxddit.com", url, flags=re.IGNORECASE)
-        resp = cffi_requests.get(
+        resp = sess.get(
             rx_url,
             headers={"User-Agent": "TelegramBot (like TwitterBot)"},
             allow_redirects=True,
-            timeout=12,
+            timeout=8,
         )
         if resp.status_code == 200 and resp.text:
             og_v = re.search(
@@ -1246,11 +1273,17 @@ def render_slideshow_to_video_sync(video_data: VideoData) -> Path | None:
 def _download_sync(url: str, max_height: int | None = None) -> VideoData:
     unique_id = uuid.uuid4().hex[:12]
     ffmpeg_path = _resolve_ffmpeg_path()
+
+    if "tiktok.com" in url.lower():
+        tikwm_res = _try_tikwm_fallback(url, unique_id, ffmpeg_path)
+        if tikwm_res:
+            return tikwm_res
+
     resolved_url = _resolve_share_redirects(url)
     if resolved_url != url:
         RESOLVED_URL_CACHE[url] = resolved_url
 
-    if "tiktok.com" in resolved_url.lower():
+    if resolved_url != url and "tiktok.com" in resolved_url.lower():
         tikwm_res = _try_tikwm_fallback(resolved_url, unique_id, ffmpeg_path)
         if tikwm_res:
             return tikwm_res
@@ -1380,40 +1413,47 @@ def _download_sync(url: str, max_height: int | None = None) -> VideoData:
 def _download_audio_sync(url: str) -> AudioData:
     unique_id = uuid.uuid4().hex[:12]
     ffmpeg_path = _resolve_ffmpeg_path()
-    resolved_url = _resolve_share_redirects(url)
+
+    if "tiktok.com" in url.lower():
+        tikwm = _try_tikwm_fallback(url, unique_id, ffmpeg_path)
+    else:
+        tikwm = None
+
+    resolved_url = _resolve_share_redirects(url) if not tikwm else url
     if resolved_url != url:
         RESOLVED_URL_CACHE[url] = resolved_url
 
-    if "tiktok.com" in resolved_url.lower():
+    if not tikwm and resolved_url != url and "tiktok.com" in resolved_url.lower():
         tikwm = _try_tikwm_fallback(resolved_url, unique_id, ffmpeg_path)
-        if tikwm:
-            if tikwm.audio_path and tikwm.audio_path.exists():
-                for img in tikwm.image_paths:
-                    img.unlink(missing_ok=True)
+
+    if tikwm:
+        if tikwm.audio_path and tikwm.audio_path.exists():
+            for img in tikwm.image_paths:
+                img.unlink(missing_ok=True)
+            return AudioData(
+                file_path=tikwm.audio_path,
+                title=tikwm.title[:100],
+                performer=tikwm.author[:80],
+            )
+        if tikwm.file_path and tikwm.file_path.exists() and ffmpeg_path:
+            mp3_out = DOWNLOAD_DIR / f"{unique_id}_extracted.mp3"
+            try:
+                subprocess.run(
+                    [ffmpeg_path, "-y", "-i", str(tikwm.file_path), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3_out)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=60,
+                )
+                tikwm.cleanup()
                 return AudioData(
-                    file_path=tikwm.audio_path,
+                    file_path=mp3_out,
                     title=tikwm.title[:100],
                     performer=tikwm.author[:80],
                 )
-            if tikwm.file_path and tikwm.file_path.exists() and ffmpeg_path:
-                mp3_out = DOWNLOAD_DIR / f"{unique_id}_extracted.mp3"
-                try:
-                    subprocess.run(
-                        [ffmpeg_path, "-y", "-i", str(tikwm.file_path), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", str(mp3_out)],
-                        check=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=60,
-                    )
-                    tikwm.cleanup()
-                    return AudioData(
-                        file_path=mp3_out,
-                        title=tikwm.title[:100],
-                        performer=tikwm.author[:80],
-                    )
-                except Exception:
-                    mp3_out.unlink(missing_ok=True)
-            tikwm.cleanup()
+            except Exception:
+                mp3_out.unlink(missing_ok=True)
+        tikwm.cleanup()
 
     if ("instagram.com" in resolved_url.lower() or "instagr.am" in resolved_url.lower()) and not COOKIES_FILE.exists():
         ig_vid = _try_instagram_fallback(resolved_url, unique_id, ffmpeg_path)
